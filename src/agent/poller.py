@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from src.clients.kalshi import KalshiClient
 from src.clients.polymarket import PolymarketClient
 from src.engine.normalizer import normalize_kalshi, normalize_polymarket
@@ -8,6 +9,7 @@ from src.engine.matcher import match_markets, filter_binary_kalshi
 from src.engine.arb_detector import detect_arb
 from src.engine.sizing import size_position
 from src.engine.llm_verifier import LLMVerifier
+from src.agent.resolver import resolve_pending
 from src.promotions.tracker import apply_active_promos
 from src.alerts.notifier import alert_terminal, alert_sms
 from src.db.store import Database
@@ -46,11 +48,20 @@ class PollingAgent:
     async def run(self):
         mode = "DRY RUN" if self.cfg.get("dry_run") else "LIVE"
         log.info("Arb agent started [%s] — polling every %ds", mode, self.cfg["polling"]["interval_seconds"])
+        last_resolve = 0.0
+        resolve_interval = float(self.cfg.get("polling", {}).get("resolve_interval_seconds", 3600))
         while True:
             try:
                 await self._poll_once()
             except Exception as e:
                 log.error("Poll cycle error: %s", e, exc_info=True)
+            now = time.monotonic()
+            if now - last_resolve >= resolve_interval:
+                try:
+                    await resolve_pending(self.db, self.kalshi)
+                except Exception as e:
+                    log.error("Resolver error: %s", e, exc_info=True)
+                last_resolve = now
             await asyncio.sleep(self.cfg["polling"]["interval_seconds"])
 
     async def _poll_once(self):
@@ -111,6 +122,7 @@ class PollingAgent:
         )
 
         verified_pairs = await self._verify_pairs(pairs)
+        verified_pairs = await self._refresh_polymarket_clob(verified_pairs)
 
         raw_opps = []
         for a, b in verified_pairs:
@@ -140,6 +152,9 @@ class PollingAgent:
                 dry_run=dry,
             )
             await self.db.save_opportunity(opp, sizing)
+            paper_id = await self.db.save_paper_trade(opp, sizing)
+            log.info("Paper trade #%d recorded (pair=%s edge=%.2f%% predicted=$%.2f)",
+                     paper_id, opp["pair_id"], opp["profit_pct"]*100, sizing["net_profit"])
             if dry:
                 log.info("[DRY RUN] Would place orders — skipping execution")
             else:
@@ -150,6 +165,53 @@ class PollingAgent:
             "Poll done — Kalshi:%d Poly:%d pairs:%d verified:%d opps:%d alerted:%d",
             len(k_markets), len(p_markets), len(pairs), len(verified_pairs), len(raw_opps), alerted,
         )
+
+    async def _refresh_polymarket_clob(self, pairs):
+        """Replace Polymarket Gamma prices with live CLOB ask prices.
+
+        Gamma's bestBid/bestAsk lag the order book by minutes-to-hours
+        (observed 16¢ discrepancy on Juventus). Without this, half our
+        'arbs' are phantoms based on stale displayed prices. Run this AFTER
+        LLM verification so we only burn CLOB calls on real candidates.
+        """
+        async def refresh_market(m: dict) -> dict:
+            if m.get("platform") != "polymarket":
+                return m
+            yes_book = await self.poly.fetch_clob_book(m.get("yes_token") or "")
+            no_book  = await self.poly.fetch_clob_book(m.get("no_token") or "")
+            yes_ask, yes_ask_size = self.poly.best_ask_from_book(yes_book)
+            no_ask,  no_ask_size  = self.poly.best_ask_from_book(no_book)
+            if yes_ask <= 0 or no_ask <= 0:
+                # CLOB unavailable — keep Gamma price but flag low confidence
+                return m
+            return {
+                **m,
+                "yes_price": round(yes_ask, 4),
+                "no_price": round(no_ask, 4),
+                "yes_ask_depth_usd": round(yes_ask_size * yes_ask, 2),
+                "no_ask_depth_usd": round(no_ask_size * no_ask, 2),
+                "_clob_refreshed": True,
+            }
+
+        # Each pair has unique markets; refresh by ticker to dedupe the work
+        unique_markets: dict[str, dict] = {}
+        for a, b in pairs:
+            for m in (a, b):
+                if m.get("platform") == "polymarket":
+                    unique_markets.setdefault(m["ticker"], m)
+        if not unique_markets:
+            return pairs
+        refreshed = await asyncio.gather(*[refresh_market(m) for m in unique_markets.values()])
+        by_ticker = {m["ticker"]: m for m in refreshed}
+
+        rebuilt = []
+        for a, b in pairs:
+            a2 = by_ticker.get(a.get("ticker"), a) if a.get("platform") == "polymarket" else a
+            b2 = by_ticker.get(b.get("ticker"), b) if b.get("platform") == "polymarket" else b
+            rebuilt.append((a2, b2))
+        n_refreshed = sum(1 for m in refreshed if m.get("_clob_refreshed"))
+        log.info("CLOB refresh: %d/%d Polymarket legs updated with live order book", n_refreshed, len(unique_markets))
+        return rebuilt
 
     async def _verify_pairs(self, pairs):
         """Run LLM verification on fuzzy-matched pairs to filter out lookalikes.

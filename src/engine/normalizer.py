@@ -54,6 +54,13 @@ def normalize_kalshi(raw: dict) -> Optional[dict]:
         # Use the larger of historical volume × mid OR live liquidity as our "depth" proxy
         volume_usd = max(contracts * mid_price, liquidity_usd)
 
+        # Best-ask depth: actual contracts you could buy at the current ask price.
+        # This is what bounds atomic-fill arbitrage; once exhausted, you walk the book.
+        yes_ask_size = _f("yes_ask_size_fp")
+        no_ask_size = _f("no_ask_size_fp")
+        yes_ask_depth_usd = yes_ask_size * yes_price
+        no_ask_depth_usd  = no_ask_size  * no_price
+
         return {
             "platform": "kalshi",
             "ticker": raw.get("ticker", ""),
@@ -66,6 +73,10 @@ def normalize_kalshi(raw: dict) -> Optional[dict]:
             "volume": round(volume_usd, 2),
             "volume_contracts": contracts,
             "liquidity_usd": round(liquidity_usd, 2),
+            "yes_ask_depth_usd": round(yes_ask_depth_usd, 2),
+            "no_ask_depth_usd": round(no_ask_depth_usd, 2),
+            "yes_ask_depth_contracts": yes_ask_size,
+            "no_ask_depth_contracts": no_ask_size,
             "closes_at": _parse_dt(raw.get("close_time")),
             "url": f"https://kalshi.com/markets/{raw.get('ticker', '')}",
         }
@@ -101,6 +112,18 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
             return None
 
         slug = raw.get("slug") or raw.get("id", "")
+        liq = float(raw.get("liquidity", 0) or 0)
+        per_leg_depth = liq / 2 if liq > 0 else 0
+        # Capture clobTokenIds so we can re-fetch live order-book prices via CLOB
+        # before alerting. Gamma's bestBid/bestAsk are aggregated/stale (we
+        # observed Gamma 0.78 vs CLOB 0.94 on Juventus — 16¢ discrepancy that
+        # turned a phantom "11% arb" into a 5% guaranteed loss).
+        clob_tokens = raw.get("clobTokenIds")
+        if isinstance(clob_tokens, str):
+            try:
+                clob_tokens = json.loads(clob_tokens)
+            except Exception:
+                clob_tokens = None
         return {
             "platform": "polymarket",
             "ticker": str(raw.get("id", "")),
@@ -108,6 +131,11 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
             "yes_price": round(yes_price, 4),
             "no_price": round(no_price, 4),
             "volume": float(raw.get("volume", 0)),
+            "liquidity_usd": round(liq, 2),
+            "yes_ask_depth_usd": round(per_leg_depth, 2),
+            "no_ask_depth_usd": round(per_leg_depth, 2),
+            "yes_token": clob_tokens[0] if clob_tokens and len(clob_tokens) >= 1 else None,
+            "no_token":  clob_tokens[1] if clob_tokens and len(clob_tokens) >= 2 else None,
             "closes_at": _parse_dt(raw.get("endDate")),
             "url": f"https://polymarket.com/event/{slug}",
         }

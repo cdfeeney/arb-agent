@@ -1,7 +1,7 @@
 import httpx
 import asyncio
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 log = logging.getLogger(__name__)
 
@@ -11,6 +11,41 @@ class PolymarketClient:
 
     def __init__(self, rate_limit_per_min: int = 120):
         self._semaphore = asyncio.Semaphore(max(1, rate_limit_per_min // 10))
+        self._clob_semaphore = asyncio.Semaphore(5)
+
+    async def fetch_clob_book(self, token_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch the live order book for a Polymarket binary outcome token.
+
+        Returns dict with 'asks' (sorted ascending — cheapest seller first)
+        and 'bids' (sorted descending — highest buyer first), each as
+        list of {price: str, size: str}. Returns None on error.
+
+        Use this to get TAKEABLE prices. Gamma's bestBid/bestAsk are stale
+        aggregates and have been observed off by 10–20¢ on real markets.
+        """
+        if not token_id:
+            return None
+        try:
+            async with self._clob_semaphore:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(f"{self.CLOB_URL}/book", params={"token_id": token_id})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            asks = sorted(data.get("asks", []) or [], key=lambda x: float(x.get("price", 1)))
+            bids = sorted(data.get("bids", []) or [], key=lambda x: -float(x.get("price", 0)))
+            return {"asks": asks, "bids": bids}
+        except Exception as e:
+            log.debug("CLOB book fetch failed for %s: %s", token_id[:20], e)
+            return None
+
+    @staticmethod
+    def best_ask_from_book(book: Optional[dict]) -> tuple[float, float]:
+        """Returns (price, size) of cheapest ask, or (0.0, 0.0) if no asks."""
+        if not book or not book.get("asks"):
+            return 0.0, 0.0
+        top = book["asks"][0]
+        return float(top.get("price", 0)), float(top.get("size", 0))
 
     async def fetch_markets(
         self,
