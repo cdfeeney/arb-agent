@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import sys
 from dotenv import load_dotenv
 from src.config import load_config
 from src.db.store import Database
@@ -17,7 +18,10 @@ async def main():
     db = Database(config["database"]["path"])
     await db.init()
     agent = PollingAgent(config, db)
-    await agent.run()
+    if "--once" in sys.argv:
+        await agent._poll_once()
+    else:
+        await agent.run()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -28,9 +28,13 @@ llm:
   max_pairs_per_cycle: 50      # cost cap — skip extra pairs after this many LLM calls
 
 filters:
-  min_volume: 5000             # USD — ignore illiquid markets
+  min_volume: 500              # DIAGNOSTIC: temporarily lowered from 5000 to validate pipeline.
+                               # Empirical: top binary Kalshi market in 14d window had ~$1.4k vol.
+                               # Re-tighten to 5000 once we confirm verifier behavior on real pairs.
   min_hours_to_close: 24       # skip markets expiring very soon
-  max_days_to_close: 14        # only fetch markets closing within this window — focus on short-term
+  max_days_to_close: 60        # DIAGNOSTIC: widened from 14. Most volume on Kalshi political/macro
+                               # binaries lives in the 30-90 day range. Watch for re-introduction of
+                               # the "unquoted long-dated markets" bug — if seen, narrow back.
   min_profit_pct: 0.02         # 2% minimum net edge after fees
 
 sizing:
