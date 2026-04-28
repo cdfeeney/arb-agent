@@ -27,11 +27,16 @@ def normalize_kalshi(raw: dict) -> Optional[dict]:
         # "real 19¢ guaranteed loss"). Only fall back to last/bid when ask is
         # missing; never average for executable price.
         def _pick_ask(bid: float, ask: float, last_p: float) -> float:
-            if 0 < ask < 0.99:        # real ask side, ignore $0.99/$1 placeholders
+            # Use the real ask. The only ask we treat as junk is exactly $1.00
+            # (Kalshi's placeholder when no one is actually selling). $0.99 is
+            # a real, very-tight quote and must be respected — falling back to
+            # last_price there creates phantom arbs (we observed Napoli yes_ask
+            # = 0.99 being replaced with last 0.85, making a fake 12% edge).
+            if 0 < ask < 1.0:
                 return ask
-            if last_p > 0:            # market has traded but no ask quote — last is best estimate
+            if last_p > 0:            # genuinely no ask quoted; last is the best signal
                 return last_p
-            if 0 < bid < 0.99:        # last resort — implies a tight spread or ask = $1
+            if 0 < bid < 1.0:         # last resort
                 return bid
             return 0.0
 

@@ -16,11 +16,13 @@ class KalshiClient:
     def __init__(self, api_key_id: str, private_key_path: str, rate_limit_per_min: int = 60):
         self.api_key_id = api_key_id
         self._private_key = self._load_key(private_key_path)
-        # Kalshi Basic tier nominally allows 200 reads/sec, but they enforce
-        # tighter per-endpoint and burst limits. Cap concurrency at 3 in-flight
-        # to stay well under any per-endpoint sub-limit; 11 categories will
-        # pipeline through without 429s.
-        self._semaphore = asyncio.Semaphore(3)
+        # Kalshi /markets has a tighter per-endpoint burst limit than the
+        # advertised 200/sec — observed 429s with 3 concurrent. Use 2 in-flight
+        # plus a small min-gap between request starts to land at ~20 req/sec
+        # sustained, well under any plausible burst cap.
+        self._semaphore = asyncio.Semaphore(2)
+        self._last_request_at = 0.0
+        self._min_gap_sec = 0.05
 
     def _load_key(self, path: str):
         if not path or not os.path.exists(path):
@@ -123,6 +125,12 @@ class KalshiClient:
             if cursor:
                 params["cursor"] = cursor
             async with self._semaphore:
+                # Pace requests so the global rate stays ~20 req/sec
+                now = time.monotonic()
+                gap = self._min_gap_sec - (now - self._last_request_at)
+                if gap > 0:
+                    await asyncio.sleep(gap)
+                self._last_request_at = time.monotonic()
                 resp = await client.get(
                     f"{self.BASE_URL}/markets",
                     params=params,
