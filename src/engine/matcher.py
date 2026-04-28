@@ -7,39 +7,17 @@ from rapidfuzz import fuzz
 log = logging.getLogger(__name__)
 
 
-def filter_binary_kalshi(markets: List[dict], mutex_sum_max: float = 1.15) -> List[dict]:
-    """Drop only the markets whose event_ticker group is MUTUALLY EXCLUSIVE.
+def filter_binary_kalshi(markets: List[dict]) -> List[dict]:
+    """Pass-through. Kept for API compatibility with the poller.
 
-    Kalshi groups several shapes of markets under one `event_ticker`:
-      1. Mutually exclusive ("Who wins NBA Finals?" — exactly one YES). YES
-         prices sum to ≈ $1.00. NOT arbitrageable as binaries — drop.
-      2. Independent binaries ("Will Fed hike >25bps Y/N?" alongside "Will
-         Fed cut Y/N?"). YES prices sum well above $1.00. Each child IS its
-         own binary — keep them.
-      3. Range buckets (CPI 3.0–3.1%, 3.1–3.2%, ...). Mutually exclusive but
-         compose into thresholds. Out of scope for v1 — drop with the others.
-
-    Heuristic: group markets by event_ticker, sum the yes_price across the
-    group; if sum ≤ mutex_sum_max it's effectively mutually exclusive and
-    we drop all; otherwise we keep all members. Singletons always pass.
+    Originally this dropped multi-outcome event groups (later: only mutex
+    ones, by yes-price sum). Both versions over-filtered: head-to-head
+    games and N-team championship markets are mutually exclusive WITHIN
+    Kalshi but each child is its own binary against a single-question
+    Polymarket market. We now keep everything and rely on the LLM verifier
+    to discriminate same-event from sub-question / range / unrelated.
     """
-    by_event: dict[str, list[dict]] = {}
-    for m in markets:
-        evt = m.get("event_ticker", "")
-        if not evt:
-            by_event.setdefault("__no_event__", []).append(m)
-        else:
-            by_event.setdefault(evt, []).append(m)
-
-    kept: list[dict] = []
-    for evt, group in by_event.items():
-        if evt == "__no_event__" or len(group) == 1:
-            kept.extend(group)
-            continue
-        yes_sum = sum(m.get("yes_price", 0.0) for m in group)
-        if yes_sum > mutex_sum_max:
-            kept.extend(group)
-    return kept
+    return list(markets)
 
 
 _STOPWORDS = {

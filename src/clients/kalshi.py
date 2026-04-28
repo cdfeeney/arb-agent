@@ -16,7 +16,11 @@ class KalshiClient:
     def __init__(self, api_key_id: str, private_key_path: str, rate_limit_per_min: int = 60):
         self.api_key_id = api_key_id
         self._private_key = self._load_key(private_key_path)
-        self._semaphore = asyncio.Semaphore(max(1, rate_limit_per_min // 10))
+        # Kalshi Basic tier nominally allows 200 reads/sec, but they enforce
+        # tighter per-endpoint and burst limits. Cap concurrency at 3 in-flight
+        # to stay well under any per-endpoint sub-limit; 11 categories will
+        # pipeline through without 429s.
+        self._semaphore = asyncio.Semaphore(3)
 
     def _load_key(self, path: str):
         if not path or not os.path.exists(path):
@@ -48,38 +52,87 @@ class KalshiClient:
     async def fetch_markets(
         self,
         limit: int = 200,
-        max_markets: int = 2000,
+        max_per_category: int = 5000,
         max_days_to_close: int = 14,
         min_hours_to_close: int = 24,
+        categories: List[str] | None = None,
     ) -> List[Dict[str, Any]]:
+        """Fetch open markets, optionally restricted to a list of categories.
+
+        When `categories` is given, each category is fetched in parallel and
+        results are unioned + deduplicated by ticker. This dodges the global
+        default-sort cap that hides niche segments (e.g. esports markets get
+        buried behind political/finance markets in the unfiltered firehose).
+        """
         now = int(time.time())
         min_close = now + min_hours_to_close * 3600
         max_close = now + max_days_to_close * 86400
-        markets = []
-        cursor = None
-        path = "/trade-api/v2/markets"
+
         async with httpx.AsyncClient(timeout=30) as client:
-            while len(markets) < max_markets:
-                params: dict = {
-                    "limit": limit,
-                    "status": "open",
-                    "min_close_ts": min_close,
-                    "max_close_ts": max_close,
-                }
-                if cursor:
-                    params["cursor"] = cursor
-                async with self._semaphore:
-                    resp = await client.get(
-                        f"{self.BASE_URL}/markets",
-                        params=params,
-                        headers=self._auth_headers("GET", path),
-                    )
-                resp.raise_for_status()
-                data = resp.json()
-                batch = data.get("markets", [])
-                markets.extend(batch)
-                cursor = data.get("cursor")
-                if not cursor or not batch:
-                    break
-        log.info(f"Kalshi: fetched {len(markets)} markets (closing in {min_hours_to_close}h–{max_days_to_close}d)")
+            if categories:
+                results = await asyncio.gather(
+                    *[
+                        self._fetch_one_segment(client, limit, max_per_category, min_close, max_close, cat)
+                        for cat in categories
+                    ]
+                )
+                merged: dict[str, dict] = {}
+                for batch in results:
+                    for m in batch:
+                        t = m.get("ticker")
+                        if t and t not in merged:
+                            merged[t] = m
+                markets = list(merged.values())
+                log.info(
+                    "Kalshi: fetched %d unique markets across %d categories (closing in %dh–%dd)",
+                    len(markets), len(categories), min_hours_to_close, max_days_to_close,
+                )
+                return markets
+
+            # Legacy unfiltered path (single firehose)
+            markets = await self._fetch_one_segment(
+                client, limit, max_per_category, min_close, max_close, category=None
+            )
+            log.info(
+                "Kalshi: fetched %d markets (closing in %dh–%dd, no category filter)",
+                len(markets), min_hours_to_close, max_days_to_close,
+            )
+            return markets
+
+    async def _fetch_one_segment(
+        self,
+        client: httpx.AsyncClient,
+        limit: int,
+        cap: int,
+        min_close: int,
+        max_close: int,
+        category: str | None,
+    ) -> List[Dict[str, Any]]:
+        path = "/trade-api/v2/markets"
+        markets: list[dict] = []
+        cursor: str | None = None
+        while len(markets) < cap:
+            params: dict = {
+                "limit": limit,
+                "status": "open",
+                "min_close_ts": min_close,
+                "max_close_ts": max_close,
+            }
+            if category:
+                params["category"] = category
+            if cursor:
+                params["cursor"] = cursor
+            async with self._semaphore:
+                resp = await client.get(
+                    f"{self.BASE_URL}/markets",
+                    params=params,
+                    headers=self._auth_headers("GET", path),
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            batch = data.get("markets", [])
+            markets.extend(batch)
+            cursor = data.get("cursor")
+            if not cursor or not batch:
+                break
         return markets

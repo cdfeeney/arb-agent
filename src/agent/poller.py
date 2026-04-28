@@ -59,6 +59,7 @@ class PollingAgent:
             self.kalshi.fetch_markets(
                 max_days_to_close=flt["max_days_to_close"],
                 min_hours_to_close=flt["min_hours_to_close"],
+                categories=self.cfg.get("kalshi", {}).get("categories"),
             ),
             self.poly.fetch_markets(
                 max_days_to_close=flt["max_days_to_close"],

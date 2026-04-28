@@ -9,6 +9,23 @@ kalshi:
   api_key_id: ""           # set via KALSHI_API_KEY_ID env var
   private_key_path: ""     # set via KALSHI_PRIVATE_KEY_PATH env var
   rate_limit_per_min: 60
+  # Category-driven fetch: each category fetched in parallel, results unioned.
+  # Targets the segments most likely to have Polymarket twins. Comment out
+  # categories to disable. Available: Politics, Elections, Sports, Economics,
+  # Crypto, Companies, Climate and Weather, World, Science and Technology,
+  # Financials, Commodities, Health, Entertainment, Mentions, Transportation.
+  categories:
+    - "Politics"
+    - "Elections"
+    - "Sports"
+    - "Economics"
+    - "Crypto"
+    - "Companies"
+    - "World"
+    - "Climate and Weather"
+    - "Science and Technology"
+    - "Financials"
+    - "Commodities"
 
 polymarket:
   gamma_url: "https://gamma-api.polymarket.com"
@@ -25,13 +42,16 @@ llm:
   api_key_env: "ANTHROPIC_API_KEY"
   model: "claude-haiku-4-5-20251001"   # cheap + fast; bump to sonnet for tougher cases
   cache_hours: 24              # re-verify a pair only after this long
-  max_pairs_per_cycle: 50      # cost cap — skip extra pairs after this many LLM calls
+  max_pairs_per_cycle: 200     # bumped from 50 — w/o multi-outcome filter, more pairs flow
 
 filters:
   min_volume: 500              # DIAGNOSTIC: temporarily lowered from 5000 to validate pipeline.
                                # Empirical: top binary Kalshi market in 14d window had ~$1.4k vol.
                                # Re-tighten to 5000 once we confirm verifier behavior on real pairs.
-  min_hours_to_close: 24       # skip markets expiring very soon
+  min_hours_to_close: 1        # DIAGNOSTIC: lowered from 24. We can't fill both legs on
+                               # a market closing in <1h, so 1h is a hard floor; 24h was
+                               # the pre-paper-trading conservative value. Re-tighten before
+                               # going live (recommended: 6h once execution latency is known).
   max_days_to_close: 60        # DIAGNOSTIC: widened from 14. Most volume on Kalshi political/macro
                                # binaries lives in the 30-90 day range. Watch for re-introduction of
                                # the "unquoted long-dated markets" bug — if seen, narrow back.

@@ -15,7 +15,7 @@ class PolymarketClient:
     async def fetch_markets(
         self,
         limit: int = 100,
-        max_markets: int = 2000,
+        max_markets: int = 10000,
         max_days_to_close: int = 14,
         min_volume: int = 5000,
     ) -> List[Dict[str, Any]]:
