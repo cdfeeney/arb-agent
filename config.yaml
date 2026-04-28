@@ -1,0 +1,62 @@
+dry_run: true   # true = find + alert opportunities but place NO real orders
+
+polling:
+  interval_seconds: 30
+  max_concurrent_fetches: 10
+
+kalshi:
+  base_url: "https://trading-api.kalshi.com/trade-api/v2"
+  api_key_id: ""           # set via KALSHI_API_KEY_ID env var
+  private_key_path: ""     # set via KALSHI_PRIVATE_KEY_PATH env var
+  rate_limit_per_min: 60
+
+polymarket:
+  gamma_url: "https://gamma-api.polymarket.com"
+  clob_url: "https://clob.polymarket.com"
+  rate_limit_per_min: 120
+
+matching:
+  similarity_threshold: 65     # rapidfuzz token_sort_ratio minimum (0-100) — broad net, LLM filters false matches
+  expiry_proximity_hours: 72   # markets must close within this window of each other
+
+llm:
+  enabled: true                # set false to skip LLM and use fuzzy match alone
+  provider: "anthropic"
+  api_key_env: "ANTHROPIC_API_KEY"
+  model: "claude-haiku-4-5-20251001"   # cheap + fast; bump to sonnet for tougher cases
+  cache_hours: 24              # re-verify a pair only after this long
+  max_pairs_per_cycle: 50      # cost cap — skip extra pairs after this many LLM calls
+
+filters:
+  min_volume: 5000             # USD — ignore illiquid markets
+  min_hours_to_close: 24       # skip markets expiring very soon
+  max_days_to_close: 14        # only fetch markets closing within this window — focus on short-term
+  min_profit_pct: 0.02         # 2% minimum net edge after fees
+
+sizing:
+  bankroll: 10000              # total capital deployed across both platforms
+  max_position_pct: 0.05       # never risk more than 5% of bankroll per opp
+  min_bet: 10                  # platform minimums
+  max_bet: 500
+  kelly_fraction: 0.25         # quarter-Kelly (conservative; tune up as you gain confidence)
+  liquidity_cap_pct: 0.10      # don't take more than 10% of available market volume
+
+fees:
+  kalshi_fee_rate: 0.07              # Kalshi: ceil(rate × N × p × (1-p)) cents per contract
+  polymarket_gas_per_order: 0.10     # Polymarket: flat USD gas per order on Polygon
+
+alerts:
+  dedup_window_minutes: 60     # suppress re-alerts for same pair within this window
+  sms_to: ""                   # your phone number e.g. +12125551234 — set via SMS_TO env var
+  sms_from: ""                 # your Twilio number e.g. +18885551234 — set via SMS_FROM env var
+
+database:
+  path: "data/opportunities.db"
+
+promotions:
+  active: []
+  # Example promo entry:
+  # - platform: "kalshi"
+  #   type: "free_bet"
+  #   amount: 100
+  #   label: "April signup bonus"
