@@ -20,25 +20,26 @@ def normalize_kalshi(raw: dict) -> Optional[dict]:
         no_ask = _f("no_ask_dollars")
         last = _f("last_price_dollars")
 
-        # Detect "junk quote" — bid=0 and ask=1 means no real market (default placeholder).
-        # Fall back to last_price if available, else skip.
-        def _pick_price(bid: float, ask: float, last_p: float) -> float:
-            spread_ok = bid > 0 and ask > 0 and (ask - bid) < 0.5
-            if spread_ok:
-                return (bid + ask) / 2
-            if last_p > 0:
-                return last_p
-            if 0 < bid:
-                return bid
-            if 0 < ask < 0.95:  # ignore junk-$1 asks
+        # CRITICAL: arb pricing must use the ASK side — what you'd actually pay
+        # to BUY the contract. Mid-price (bid+ask)/2 is NOT takeable in size on
+        # markets with wide spreads (we observed Roma yes spread = 2¢/34¢, mid
+        # = 18¢ but ask = 34¢ — the difference between "phantom 6% arb" and
+        # "real 19¢ guaranteed loss"). Only fall back to last/bid when ask is
+        # missing; never average for executable price.
+        def _pick_ask(bid: float, ask: float, last_p: float) -> float:
+            if 0 < ask < 0.99:        # real ask side, ignore $0.99/$1 placeholders
                 return ask
+            if last_p > 0:            # market has traded but no ask quote — last is best estimate
+                return last_p
+            if 0 < bid < 0.99:        # last resort — implies a tight spread or ask = $1
+                return bid
             return 0.0
 
-        yes_price = _pick_price(yes_bid, yes_ask, last)
+        yes_price = _pick_ask(yes_bid, yes_ask, last)
         if yes_price <= 0:
             return None
 
-        no_price = _pick_price(no_bid, no_ask, max(0.0, 1.0 - last) if last > 0 else 0.0)
+        no_price = _pick_ask(no_bid, no_ask, max(0.0, 1.0 - last) if last > 0 else 0.0)
         if no_price <= 0:
             no_price = max(0.01, 1.0 - yes_price)
 
@@ -70,17 +71,26 @@ def normalize_kalshi(raw: dict) -> Optional[dict]:
 
 def normalize_polymarket(raw: dict) -> Optional[dict]:
     try:
-        prices_raw = raw.get("outcomePrices", "[]")
-        if isinstance(prices_raw, str):
-            prices = json.loads(prices_raw)
+        # Prefer takeable prices (bestAsk for YES, 1-bestBid for NO ask).
+        # outcomePrices is the displayed mid; using it for arb math overstates
+        # edge by the spread on each side. Fall back to outcomePrices only if
+        # bestBid/bestAsk aren't in the response.
+        best_bid = raw.get("bestBid")
+        best_ask = raw.get("bestAsk")
+        if best_bid is not None and best_ask is not None:
+            yes_ask = float(best_ask)
+            yes_bid = float(best_bid)
+            if yes_ask <= 0 or yes_ask >= 1:
+                return None
+            yes_price = yes_ask                   # to BUY yes
+            no_price = max(0.0, 1.0 - yes_bid)    # to BUY no = 1 - yes_bid
         else:
-            prices = prices_raw
-
-        if not prices or len(prices) < 2:
-            return None
-
-        yes_price = float(prices[0])
-        no_price = float(prices[1])
+            prices_raw = raw.get("outcomePrices", "[]")
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+            if not prices or len(prices) < 2:
+                return None
+            yes_price = float(prices[0])
+            no_price = float(prices[1])
 
         if yes_price <= 0 or no_price <= 0:
             return None
