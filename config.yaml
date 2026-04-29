@@ -77,6 +77,19 @@ alerts:
 database:
   path: "data/opportunities.db"
 
+# Position-monitor / exit logic. Each cycle, mark-to-market every open paper
+# trade; recommend EXIT when convergence threshold hit OR when annualized
+# return on early exit beats hold-to-resolution by required multiple. In dry
+# run mode, EXIT is paper-only — sets the trade status to 'exited' and
+# applies a re-entry cooldown so the scanner doesn't re-buy into our move.
+exit:
+  enabled: true
+  convergence_threshold: 0.7        # exit when 70% of arb captured by spread tightening
+  annualized_multiple: 1.5          # exit if early-exit annualized > 1.5× hold annualized
+  max_slippage_pct: 0.02            # downgrade EXIT to HOLD if VWAP slips >2% from best bid
+  cooldown_minutes: 60              # don't re-enter exited pairs for this long
+  min_days_remaining_to_force_hold: 0.5   # within 12h of resolution, always hold
+
 # Correlated-lag detector (Phase 2 strategy). When BTC moves significantly
 # but Kalshi crypto markets haven't repriced, emit a directional signal.
 # See LAG_DESIGN.md.

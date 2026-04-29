@@ -11,6 +11,7 @@ from src.engine.arb_detector import detect_arb
 from src.engine.sizing import size_position
 from src.engine.llm_verifier import LLMVerifier
 from src.engine import lag_detector
+from src.engine import position_monitor
 from src.agent.resolver import resolve_pending
 from src.promotions.tracker import apply_active_promos
 from src.alerts.notifier import alert_terminal, alert_sms
@@ -41,6 +42,7 @@ class PollingAgent:
                 reconnect_seconds=float(feed_cfg.get("reconnect_seconds", 5)),
                 binance_us_endpoint=bool(feed_cfg.get("binance_us_endpoint", False)),
             )
+        self.exit_cfg = position_monitor.ExitConfig.from_dict(config.get("exit", {}))
 
     def _build_verifier(self) -> LLMVerifier | None:
         llm_cfg = self.cfg.get("llm", {})
@@ -153,8 +155,15 @@ class PollingAgent:
         opportunities = apply_active_promos(raw_opps, self.cfg["promotions"]["active"])
 
         alerted = 0
+        cooldown_minutes = self.exit_cfg.cooldown_minutes
         for opp in opportunities:
             if await self.db.seen_recently(opp["pair_id"], self.cfg["alerts"]["dedup_window_minutes"]):
+                continue
+            if cooldown_minutes > 0 and await self.db.is_in_cooldown(
+                opp["pair_id"], cooldown_minutes,
+            ):
+                log.info("Skipping %s — in re-entry cooldown (%dmin)",
+                         opp["pair_id"][:60], cooldown_minutes)
                 continue
             sizing = size_position(opp, {**self.cfg["sizing"], "fees": self.cfg.get("fees", {})})
             if sizing["bet_size"] < self.cfg["sizing"]["min_bet"]:
@@ -176,6 +185,22 @@ class PollingAgent:
             else:
                 pass  # order execution goes here in Phase 3
             alerted += 1
+
+        # Mark-to-market every still-open paper trade. Runs even on cycles
+        # where we found 0 new arbs — open positions need monitoring too.
+        try:
+            mon = await position_monitor.monitor_open_positions(
+                self.db, self.kalshi, self.poly, self.exit_cfg,
+                dry_run=self.cfg.get("dry_run", True),
+            )
+            if mon["n_open"] > 0:
+                log.info(
+                    "Monitor: open=%d marked=%d EXIT=%d WATCH=%d HOLD=%d skipped=%d",
+                    mon["n_open"], mon["n_marked"], mon["exits"],
+                    mon["watches"], mon["holds"], mon["skipped"],
+                )
+        except Exception as e:
+            log.error("Position monitor error: %s", e, exc_info=True)
 
         log.info(
             "Poll done — Kalshi:%d Poly:%d pairs:%d verified:%d opps:%d alerted:%d",

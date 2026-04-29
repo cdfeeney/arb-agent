@@ -47,6 +47,46 @@ class PolymarketClient:
         top = book["asks"][0]
         return float(top.get("price", 0)), float(top.get("size", 0))
 
+    @staticmethod
+    def best_bid_from_book(book: Optional[dict]) -> tuple[float, float]:
+        """Returns (price, size) of highest bid, or (0.0, 0.0) if no bids.
+
+        Used by the position monitor to estimate the unwind price.
+        """
+        if not book or not book.get("bids"):
+            return 0.0, 0.0
+        top = book["bids"][0]
+        return float(top.get("price", 0)), float(top.get("size", 0))
+
+    @staticmethod
+    def walk_bids(book: Optional[dict], target_contracts: float) -> tuple[float, float]:
+        """Walk the bid book to fill `target_contracts`, return (vwap, filled).
+
+        Returns the volume-weighted average price across however many
+        contracts we could fill (may be less than target on a thin book).
+        """
+        if target_contracts <= 0 or not book or not book.get("bids"):
+            return 0.0, 0.0
+        remaining = target_contracts
+        spent = 0.0
+        filled = 0.0
+        for entry in book["bids"]:
+            if remaining <= 0:
+                break
+            try:
+                price = float(entry.get("price", 0))
+                size = float(entry.get("size", 0))
+            except (TypeError, ValueError):
+                continue
+            if price <= 0 or size <= 0:
+                continue
+            take = min(remaining, size)
+            spent += take * price
+            filled += take
+            remaining -= take
+        avg = spent / filled if filled > 0 else 0.0
+        return avg, filled
+
     async def fetch_markets(
         self,
         limit: int = 100,

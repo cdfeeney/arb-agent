@@ -132,6 +132,53 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_mph_ticker_time "
                 "ON market_price_history(platform, ticker, observed_at)"
             )
+
+            # Mark-to-market history of open paper trades. One row per
+            # monitor cycle per open position. Used to backtest exit
+            # thresholds and surface live recommendations.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS paper_trade_marks (
+                    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_trade_id           INTEGER NOT NULL,
+                    observed_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                    yes_bid_now              REAL,
+                    yes_bid_vwap             REAL,
+                    yes_bid_fill_contracts   REAL,
+                    no_bid_now               REAL,
+                    no_bid_vwap              REAL,
+                    no_bid_fill_contracts    REAL,
+
+                    cost_basis_usd           REAL,
+                    unwind_value_usd         REAL,
+                    locked_payout_usd        REAL,
+                    mark_to_market_usd       REAL,
+                    convergence_ratio        REAL,
+                    slippage_pct             REAL,
+
+                    days_held                REAL,
+                    days_remaining           REAL,
+                    annualized_now_pct       REAL,
+                    annualized_to_close_pct  REAL,
+
+                    exit_recommendation      TEXT,
+                    decision_reason          TEXT
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_marks_trade_time "
+                "ON paper_trade_marks(paper_trade_id, observed_at)"
+            )
+
+            # Track exit cooldowns to prevent re-entry into pairs we just
+            # exited (whose own exit may have widened the apparent spread).
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS pair_cooldowns (
+                    pair_id    TEXT PRIMARY KEY,
+                    exited_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    reason     TEXT
+                )
+            """)
             await db.commit()
         log.info(f"Database ready: {self.path}")
 
@@ -355,6 +402,92 @@ class Database:
                  revert_seconds, signal_id),
             )
             await db.commit()
+
+    # ---- Position-monitor helpers ----
+
+    async def list_open_paper_trades(self) -> list[dict]:
+        """All paper trades still in 'open' status (regardless of close time)."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM paper_trades WHERE status='open' ORDER BY detected_at"
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def save_paper_trade_mark(self, mark: dict) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """INSERT INTO paper_trade_marks (
+                    paper_trade_id,
+                    yes_bid_now, yes_bid_vwap, yes_bid_fill_contracts,
+                    no_bid_now,  no_bid_vwap,  no_bid_fill_contracts,
+                    cost_basis_usd, unwind_value_usd, locked_payout_usd,
+                    mark_to_market_usd, convergence_ratio, slippage_pct,
+                    days_held, days_remaining,
+                    annualized_now_pct, annualized_to_close_pct,
+                    exit_recommendation, decision_reason
+                ) VALUES (?,
+                          ?,?,?, ?,?,?,
+                          ?,?,?, ?,?,?,
+                          ?,?, ?,?,
+                          ?,?)""",
+                (
+                    mark["paper_trade_id"],
+                    mark.get("yes_bid_now"), mark.get("yes_bid_vwap"),
+                    mark.get("yes_bid_fill_contracts"),
+                    mark.get("no_bid_now"), mark.get("no_bid_vwap"),
+                    mark.get("no_bid_fill_contracts"),
+                    mark.get("cost_basis_usd"), mark.get("unwind_value_usd"),
+                    mark.get("locked_payout_usd"),
+                    mark.get("mark_to_market_usd"), mark.get("convergence_ratio"),
+                    mark.get("slippage_pct"),
+                    mark.get("days_held"), mark.get("days_remaining"),
+                    mark.get("annualized_now_pct"), mark.get("annualized_to_close_pct"),
+                    mark.get("exit_recommendation"), mark.get("decision_reason"),
+                ),
+            )
+            await db.commit()
+            return cur.lastrowid
+
+    async def mark_paper_trade_exited(
+        self, trade_id: int, mark_to_market_usd: float, reason: str,
+    ) -> None:
+        """Move a paper trade to 'exited' status (paper-only — no real sell)."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """UPDATE paper_trades SET
+                       status='exited',
+                       resolved_at=?,
+                       realized_profit_usd=?
+                   WHERE id=? AND status='open'""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    round(mark_to_market_usd, 4), trade_id,
+                ),
+            )
+            await db.commit()
+
+    async def add_pair_cooldown(self, pair_id: str, reason: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO pair_cooldowns (pair_id, exited_at, reason) "
+                "VALUES (?, ?, ?)",
+                (pair_id, datetime.now(timezone.utc).isoformat(), reason),
+            )
+            await db.commit()
+
+    async def is_in_cooldown(self, pair_id: str, cooldown_minutes: int) -> bool:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=cooldown_minutes)
+        ).isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                "SELECT 1 FROM pair_cooldowns WHERE pair_id=? AND exited_at>? LIMIT 1",
+                (pair_id, cutoff),
+            )
+            return await cur.fetchone() is not None
+
+    # ---- Lag-detector helpers ----
 
     async def open_lag_signals(self, max_age_minutes: int = 5) -> list[dict]:
         """Recent open lag signals awaiting a t2 observation."""
