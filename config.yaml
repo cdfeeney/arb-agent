@@ -77,6 +77,33 @@ alerts:
 database:
   path: "data/opportunities.db"
 
+# Correlated-lag detector (Phase 2 strategy). When BTC moves significantly
+# but Kalshi crypto markets haven't repriced, emit a directional signal.
+# See LAG_DESIGN.md.
+lag:
+  enabled: true
+  underlying: "BTC"
+  feed:
+    source: "coinbase"     # coinbase (US-friendly default) or binance
+    symbol: "BTC-USD"      # coinbase uses BTC-USD; binance uses btcusdt
+    reconnect_seconds: 5
+    binance_us_endpoint: false  # set true if using binance source from a US IP
+  detection:
+    window_seconds: 60
+    btc_threshold_pct: 2.0          # |BTC change| must exceed this
+    market_flat_threshold_pp: 0.5   # market mid moved less than this = "flat"
+    min_market_volume: 500
+  ticker_prefixes:
+    - "KXBTC"
+    - "KXBTCD"
+    - "KXBTCMAXY"
+    - "KXETH"
+  question_keywords:
+    - "bitcoin"
+    - "btc"
+    - "ethereum"
+    - "eth"
+
 promotions:
   active: []
   # Example promo entry:

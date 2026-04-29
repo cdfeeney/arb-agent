@@ -8,3 +8,4 @@ python-dateutil>=2.9.0
 twilio>=9.0.0
 cryptography>=42.0.0
 anthropic>=0.40.0
+websockets>=12.0

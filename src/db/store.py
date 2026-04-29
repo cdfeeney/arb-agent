@@ -75,6 +75,63 @@ class Database:
             """)
             await db.execute("CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status, closes_at)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_paper_pair ON paper_trades(pair_id, detected_at)")
+
+            # Lag signals: directional bets driven by underlying price moves
+            # (e.g. BTC moves but Kalshi crypto market hasn't repriced yet).
+            # See LAG_DESIGN.md for the data flow and signal model.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS lag_signals (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    detected_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                    market_platform     TEXT NOT NULL,
+                    market_ticker       TEXT NOT NULL,
+                    market_event_ticker TEXT,
+                    market_question     TEXT,
+                    market_url          TEXT,
+                    market_closes_at    TIMESTAMP,
+
+                    underlying          TEXT NOT NULL,
+                    btc_price_t0        REAL,
+                    btc_price_t1        REAL,
+                    btc_pct_change      REAL,
+                    window_seconds      INTEGER,
+
+                    market_price_t0     REAL,
+                    market_price_t1     REAL,
+                    market_pp_change    REAL,
+
+                    direction           TEXT,
+                    signal_strength     REAL,
+
+                    market_price_t2     REAL,
+                    market_repriced     INTEGER,
+                    revert_seconds      INTEGER,
+
+                    status              TEXT DEFAULT 'open'
+                )
+            """)
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_lag_status ON lag_signals(status, detected_at)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_lag_market ON lag_signals(market_ticker, detected_at)")
+
+            # Per-market price history for the lag detector. Stored separately
+            # from signals so we have continuous time-series for comparison
+            # even on cycles that don't produce a signal.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS market_price_history (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform    TEXT NOT NULL,
+                    ticker      TEXT NOT NULL,
+                    observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    yes_price   REAL,
+                    no_price    REAL,
+                    mid_price   REAL
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mph_ticker_time "
+                "ON market_price_history(platform, ticker, observed_at)"
+            )
             await db.commit()
         log.info(f"Database ready: {self.path}")
 
@@ -211,3 +268,104 @@ class Database:
                    FROM paper_trades GROUP BY status"""
             )
             return {r["status"]: dict(r) for r in await cur.fetchall()}
+
+    # ---- Lag-detector helpers ----
+
+    async def record_market_prices(self, snapshots: list[dict]) -> None:
+        """Bulk-insert price observations. Each snapshot:
+            {platform, ticker, yes_price, no_price, mid_price}
+        Called once per arb cycle for every crypto market we track.
+        """
+        if not snapshots:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        rows = [
+            (
+                s["platform"], s["ticker"], now,
+                s.get("yes_price"), s.get("no_price"), s.get("mid_price"),
+            )
+            for s in snapshots
+        ]
+        async with aiosqlite.connect(self.path) as db:
+            await db.executemany(
+                "INSERT INTO market_price_history "
+                "(platform, ticker, observed_at, yes_price, no_price, mid_price) "
+                "VALUES (?,?,?,?,?,?)",
+                rows,
+            )
+            await db.commit()
+
+    async def market_price_at_or_before(
+        self, platform: str, ticker: str, target: datetime,
+    ) -> dict | None:
+        """Most recent price observation for (platform, ticker) at or before target."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """SELECT yes_price, no_price, mid_price, observed_at
+                   FROM market_price_history
+                   WHERE platform=? AND ticker=? AND observed_at <= ?
+                   ORDER BY observed_at DESC LIMIT 1""",
+                (platform, ticker, target.isoformat()),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def save_lag_signal(self, signal: dict) -> int:
+        """Insert a lag-signal row. Returns the new id."""
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """INSERT INTO lag_signals (
+                    market_platform, market_ticker, market_event_ticker,
+                    market_question, market_url, market_closes_at,
+                    underlying,
+                    btc_price_t0, btc_price_t1, btc_pct_change, window_seconds,
+                    market_price_t0, market_price_t1, market_pp_change,
+                    direction, signal_strength
+                ) VALUES (?,?,?, ?,?,?, ?, ?,?,?,?, ?,?,?, ?,?)""",
+                (
+                    signal["market_platform"], signal["market_ticker"],
+                    signal.get("market_event_ticker"),
+                    signal.get("market_question"), signal.get("market_url"),
+                    signal["market_closes_at"].isoformat()
+                        if signal.get("market_closes_at") else None,
+                    signal["underlying"],
+                    signal.get("btc_price_t0"), signal.get("btc_price_t1"),
+                    signal.get("btc_pct_change"), signal.get("window_seconds"),
+                    signal.get("market_price_t0"), signal.get("market_price_t1"),
+                    signal.get("market_pp_change"),
+                    signal.get("direction"), signal.get("signal_strength"),
+                ),
+            )
+            await db.commit()
+            return cur.lastrowid
+
+    async def update_lag_signal_observation(
+        self, signal_id: int, market_price_t2: float,
+        market_repriced: bool, revert_seconds: int | None,
+    ) -> None:
+        """Fill in resolution fields for a previously-emitted signal."""
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """UPDATE lag_signals SET
+                       market_price_t2=?, market_repriced=?,
+                       revert_seconds=?, status='observed'
+                   WHERE id=? AND status='open'""",
+                (market_price_t2, 1 if market_repriced else 0,
+                 revert_seconds, signal_id),
+            )
+            await db.commit()
+
+    async def open_lag_signals(self, max_age_minutes: int = 5) -> list[dict]:
+        """Recent open lag signals awaiting a t2 observation."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+        ).isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM lag_signals WHERE status='open' AND detected_at>=? "
+                "ORDER BY detected_at",
+                (cutoff,),
+            )
+            return [dict(r) for r in await cur.fetchall()]

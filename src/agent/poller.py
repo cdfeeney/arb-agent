@@ -4,11 +4,13 @@ import os
 import time
 from src.clients.kalshi import KalshiClient
 from src.clients.polymarket import PolymarketClient
+from src.clients.btc_feed import BTCFeed
 from src.engine.normalizer import normalize_kalshi, normalize_polymarket
 from src.engine.matcher import match_markets, filter_binary_kalshi
 from src.engine.arb_detector import detect_arb
 from src.engine.sizing import size_position
 from src.engine.llm_verifier import LLMVerifier
+from src.engine import lag_detector
 from src.agent.resolver import resolve_pending
 from src.promotions.tracker import apply_active_promos
 from src.alerts.notifier import alert_terminal, alert_sms
@@ -29,6 +31,16 @@ class PollingAgent:
             rate_limit_per_min=config["polymarket"]["rate_limit_per_min"],
         )
         self.verifier = self._build_verifier()
+        self.lag_cfg = lag_detector.LagConfig.from_dict(config.get("lag", {}))
+        self.btc_feed: BTCFeed | None = None
+        if self.lag_cfg.enabled:
+            feed_cfg = config.get("lag", {}).get("feed", {})
+            self.btc_feed = BTCFeed(
+                source=feed_cfg.get("source", "coinbase"),
+                symbol=feed_cfg.get("symbol", "BTC-USD"),
+                reconnect_seconds=float(feed_cfg.get("reconnect_seconds", 5)),
+                binance_us_endpoint=bool(feed_cfg.get("binance_us_endpoint", False)),
+            )
 
     def _build_verifier(self) -> LLMVerifier | None:
         llm_cfg = self.cfg.get("llm", {})
@@ -113,6 +125,10 @@ class PollingAgent:
             len(kalshi_raw), len(k_normalized), len(k_binary), len(k_markets),
             len(poly_raw), len(p_normalized), len(p_markets),
         )
+
+        # Lag detection runs alongside arb detection on the same Kalshi
+        # market snapshot. Failures here must not abort the arb cycle.
+        await self._run_lag_detection(k_markets)
 
         pairs = match_markets(
             k_markets,
@@ -212,6 +228,29 @@ class PollingAgent:
         n_refreshed = sum(1 for m in refreshed if m.get("_clob_refreshed"))
         log.info("CLOB refresh: %d/%d Polymarket legs updated with live order book", n_refreshed, len(unique_markets))
         return rebuilt
+
+    async def _run_lag_detection(self, k_markets: list[dict]) -> None:
+        """Scan crypto markets for BTC-vs-market lag signals + observe pending."""
+        if not self.lag_cfg.enabled or self.btc_feed is None:
+            return
+        try:
+            crypto = [m for m in k_markets if lag_detector.is_crypto_market(m, self.lag_cfg)]
+            if not crypto:
+                log.info("Lag: no crypto markets in this cycle")
+                return
+            observed = await lag_detector.observe_pending_signals(crypto, self.db, self.lag_cfg)
+            summary = await lag_detector.scan(crypto, self.btc_feed, self.db, self.lag_cfg)
+            log.info(
+                "Lag: %d crypto mkts | BTC=%s (%+.2f%%) | signals=%d | "
+                "observed_prev=%d | skipped: feed=%d hist=%d btcflat=%d mvd=%d",
+                summary["n_markets"],
+                summary["btc_price"], summary["btc_pct_change"] or 0.0,
+                summary["signals_emitted"], observed,
+                summary["skipped_no_feed"], summary["skipped_no_history"],
+                summary["skipped_btc_flat"], summary["skipped_market_moved"],
+            )
+        except Exception as e:
+            log.error("Lag detection error: %s", e, exc_info=True)
 
     async def _verify_pairs(self, pairs):
         """Run LLM verification on fuzzy-matched pairs to filter out lookalikes.
