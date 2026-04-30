@@ -242,10 +242,21 @@ class Database:
         payload["buy_no_platform"] = opp["buy_no"]["platform"]
         payload["buy_no_url"] = opp["buy_no"]["url"]
 
+        # Pass seen_at explicitly in ISO format so the dedup query in
+        # seen_recently() can compare apples-to-apples. SQLite's DEFAULT
+        # CURRENT_TIMESTAMP writes "YYYY-MM-DD HH:MM:SS" (space) but the
+        # cutoff in seen_recently is Python isoformat "YYYY-MM-DDTHH:MM:SS+TZ"
+        # (T-separator). String comparison fails on the separator: " " (0x20)
+        # < "T" (0x54), so seen_at > cutoff was always False — broke dedup
+        # entirely. We were saving a duplicate row every cycle (this is why
+        # 131 of 132 paper trades hit the same Gallego pair).
+        seen_at = datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT INTO opportunities (pair_id, profit_pct, bet_size, data) VALUES (?,?,?,?)",
-                (opp["pair_id"], opp["profit_pct"], sizing["bet_size"], json.dumps(payload)),
+                "INSERT INTO opportunities (pair_id, profit_pct, bet_size, data, seen_at)"
+                " VALUES (?,?,?,?,?)",
+                (opp["pair_id"], opp["profit_pct"], sizing["bet_size"],
+                 json.dumps(payload), seen_at),
             )
             await db.commit()
 
@@ -389,17 +400,23 @@ class Database:
 
     async def save_lag_signal(self, signal: dict) -> int:
         """Insert a lag-signal row. Returns the new id."""
+        # Same dedup-format trap as save_opportunity: open_lag_signals queries
+        # by `detected_at >= cutoff` where cutoff is Python isoformat. Pass
+        # detected_at explicitly so they're string-comparable.
+        detected_at = datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
                 """INSERT INTO lag_signals (
+                    detected_at,
                     market_platform, market_ticker, market_event_ticker,
                     market_question, market_url, market_closes_at,
                     underlying,
                     btc_price_t0, btc_price_t1, btc_pct_change, window_seconds,
                     market_price_t0, market_price_t1, market_pp_change,
                     direction, signal_strength
-                ) VALUES (?,?,?, ?,?,?, ?, ?,?,?,?, ?,?,?, ?,?)""",
+                ) VALUES (?, ?,?,?, ?,?,?, ?, ?,?,?,?, ?,?,?, ?,?)""",
                 (
+                    detected_at,
                     signal["market_platform"], signal["market_ticker"],
                     signal.get("market_event_ticker"),
                     signal.get("market_question"), signal.get("market_url"),

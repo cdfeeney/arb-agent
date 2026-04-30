@@ -7,22 +7,33 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-VERIFY_PROMPT = """You are verifying whether two binary prediction markets resolve on the IDENTICAL underlying event. Cross-platform arbitrage requires that "YES on market A" and "NO on market B" are perfect economic opposites.
+VERIFY_PROMPT = """You are verifying whether two binary prediction markets resolve on the IDENTICAL underlying event. Cross-platform arbitrage requires that "YES on market A" and "YES on market B" mean the same thing — that the same real-world outcome would resolve both to YES.
 
 Return a single JSON object: {{"is_match": true|false, "reasoning": "<1-2 sentences>"}}
 
-Mark is_match=true ONLY if BOTH conditions hold:
-1. The same real-world outcome resolves both markets (same event, same threshold, same time window).
-2. YES on market A and YES on market B mean the same thing — a YES on one would be a YES on the other.
+Mark is_match=TRUE when:
+- The same real-world outcome resolves both markets to YES, AND
+- The resolution date/window aligns (within a few days), AND
+- The threshold (if any) is the same.
 
-Mark is_match=false if:
-- One is a sub-question of the other (e.g. "Fed cuts rates" vs "Who dissents at FOMC?").
+Wording differences that DO NOT matter (still match):
+- "Will X win?" vs "Who will win? – X"
+- "X out by date Y?" vs "Will X be out before date Y+1?"
+- "Will X receive the most votes?" vs "Who will win the primary? – X"
+- Verbose Kalshi rules vs Polymarket short questions, when the underlying event is identical.
+- Multi-outcome Kalshi event ("Who will IPO before 2027? – Kraken") matching a binary
+  Polymarket question ("Kraken IPO by Dec 31, 2026?") — these ARE legitimate arbs as long
+  as the date window matches.
+
+Mark is_match=FALSE when:
 - Different thresholds or time windows ("BTC > $100k by Dec 31" vs "BTC > $100k by Jan 31").
-- One is multi-outcome and the other is binary on a different slice.
-- Different resolution sources that could disagree.
-- Phrasing is similar but the events differ.
+- One is a strict sub-question of the other ("Fed cuts rates" vs "Who dissents at FOMC?").
+- Different resolution sources that could plausibly disagree on outcome.
+- The underlying events are genuinely different.
 
-Be strict. False positives cost real money; false negatives just skip an opp.
+Calibration: false positives cost real money; false negatives leave money on the table.
+Both are bad. Lean toward MATCH when the resolution criterion is clearly the same despite
+different phrasing — your job is to spot semantic equivalence, not punish word variation.
 
 Market A (Kalshi):
   Question: {a_question}

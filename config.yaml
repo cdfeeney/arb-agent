@@ -52,8 +52,11 @@ filters:
                                # a market closing in <1h, so 1h is a hard floor; 24h was
                                # the pre-paper-trading conservative value. Re-tighten before
                                # going live (recommended: 6h once execution latency is known).
-  max_days_to_close: 60        # DIAGNOSTIC: widened from 14. Most volume on Kalshi political/macro
-                               # binaries lives in the 30-90 day range. Watch for re-introduction of
+  max_days_to_close: 365       # Widened from 60 to 365 (2026-04-30): third-party arb tracker
+                               # showed 70%+ of available cross-platform arbs live in the
+                               # 180-921 day range (2026 elections, IPOs, year-end policy
+                               # bets). The 60-day window was systematically excluding the
+                               # bulk of the opportunity set. Watch for re-introduction of
                                # the "unquoted long-dated markets" bug — if seen, narrow back.
   min_profit_pct: 0.02         # 2% minimum net edge after fees
 

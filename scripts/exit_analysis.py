@@ -72,26 +72,45 @@ async def main() -> None:
                 f"\n",
             )
 
-        # Per-trade detail when verbose enough samples
-        print("Per-trade exit-vs-hold (top 20 by realized):\n")
+        # Per-trade detail.
+        #
+        # Two different "P&L" numbers tell different stories — display both:
+        #   * MTM (mark-to-market): unwind value at today's bid books minus
+        #     cost basis. Goes deeply negative on thin books even when the
+        #     arb is fine, because we can't sell into nothing. NOT a real
+        #     loss unless we actually try to exit.
+        #   * Resolution P&L: locked_payout (= min(yes,no)*$1) minus cost
+        #     basis. This is what we'd actually collect by holding to
+        #     resolution. For a real arb this should ≈ predicted_net_usd.
+        #
+        # If MTM craters but resolution P&L ≈ predicted, the position is
+        # fine — just hold to close. If both crater, the entry math was
+        # wrong (true phantom).
+        print(
+            "Per-trade detail — pred = expected at entry, hold = expected at"
+            " resolution, mtm = liquidation today (top 20):\n"
+        )
         cur = await db.execute(
-            """SELECT pt.id, pt.pair_id, pt.detected_at, pt.closes_at,
-                      pt.predicted_net_usd, pt.realized_profit_usd, pt.status,
-                      MAX(m.convergence_ratio) max_conv,
-                      MAX(m.mark_to_market_usd) max_mtm,
-                      MIN(m.mark_to_market_usd) min_mtm
+            """SELECT pt.id, pt.pair_id, pt.predicted_net_usd, pt.status,
+                      pt.yes_size_usd + pt.no_size_usd                AS cost,
+                      MAX(m.locked_payout_usd) - (pt.yes_size_usd + pt.no_size_usd)
+                                                                       AS hold_pnl,
+                      MAX(m.mark_to_market_usd)                       AS max_mtm,
+                      MIN(m.mark_to_market_usd)                       AS min_mtm,
+                      MAX(m.convergence_ratio)                        AS max_conv
                FROM paper_trades pt
                JOIN paper_trade_marks m ON m.paper_trade_id = pt.id
                GROUP BY pt.id
-               ORDER BY pt.realized_profit_usd DESC NULLS LAST LIMIT 20""",
+               ORDER BY pt.detected_at DESC LIMIT 20""",
         )
         for r in await cur.fetchall():
+            hold = r["hold_pnl"] if r["hold_pnl"] is not None else 0.0
             print(
                 f"  #{r['id']:>4}  status={r['status']:<8} "
+                f"cost=${(r['cost'] or 0):>6.2f}  "
                 f"pred=${r['predicted_net_usd']:>6.2f}  "
-                f"realized=${(r['realized_profit_usd'] or 0):>6.2f}  "
-                f"max_conv={(r['max_conv'] or 0)*100:>5.1f}%  "
-                f"mtm range=[{r['min_mtm'] or 0:.2f}, {r['max_mtm'] or 0:.2f}]"
+                f"hold=${hold:>6.2f}  "
+                f"mtm=[{(r['min_mtm'] or 0):>7.2f}..{(r['max_mtm'] or 0):>7.2f}]"
             )
             print(f"    {r['pair_id'][:80]}")
 
