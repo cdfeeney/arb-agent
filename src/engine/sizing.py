@@ -14,8 +14,11 @@ Rules applied in order (each can only reduce the bet size):
   1. Kelly criterion   — bankroll × edge / cost_per_contract × kelly_fraction
   2. Bankroll cap      — total stake never exceeds max_position_pct × bankroll
   3. Liquidity cap     — neither leg's USD exceeds liquidity_cap_pct × that side's volume
-  4. Max bet           — hard ceiling from config (total stake)
-  5. Min bet floor     — hard floor from config
+  4. Book-depth cap    — never enter more than book_depth_fraction × min(yes_bid_depth,
+                          no_bid_depth) on the unwind side. Stops "phantom MTM" losses
+                          from positions too large to exit at top-of-book.
+  5. Max bet           — hard ceiling from config (total stake)
+  6. Min bet floor     — hard floor from config
 """
 
 from .fees import compute_arb_fees
@@ -48,8 +51,30 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
     else:
         liquidity_cap = bankroll_cap  # fallback when volume data missing
 
+    # 4. Book-depth cap — bound entry by the bid-side liquidity we'll need for
+    # unwind. Each leg's contract count is capped by `book_depth_fraction` of
+    # that side's bid-book USD depth. Convert leg-USD caps back to a total-
+    # stake cap via cost_per_contract. This enforces the user's "$10 → $1"
+    # principle: take small positions in shallow markets, larger in deep ones.
+    depth_fraction = float(cfg.get("book_depth_fraction", 0.25))
+    yes_bid_depth = float(opportunity["buy_yes"].get("yes_bid_depth_usd", 0) or 0)
+    no_bid_depth = float(opportunity["buy_no"].get("no_bid_depth_usd", 0) or 0)
+    if yes_bid_depth > 0 and no_bid_depth > 0:
+        max_yes_unwind_usd = yes_bid_depth * depth_fraction
+        max_no_unwind_usd = no_bid_depth * depth_fraction
+        max_contracts_yes_depth = max_yes_unwind_usd / max(yes_price, 0.01)
+        max_contracts_no_depth = max_no_unwind_usd / max(no_price, 0.01)
+        max_contracts_depth = min(max_contracts_yes_depth, max_contracts_no_depth)
+        book_depth_cap = max_contracts_depth * cost_per_contract
+    else:
+        # Bid depth unavailable — fall back to bankroll cap so we don't reject
+        # the trade entirely. Logged as "depth unknown" via limiting_rule.
+        book_depth_cap = bankroll_cap
+
     # Apply all caps
-    total_stake = min(kelly_stake, bankroll_cap, liquidity_cap, cfg["max_bet"])
+    total_stake = min(
+        kelly_stake, bankroll_cap, liquidity_cap, book_depth_cap, cfg["max_bet"],
+    )
     total_stake = max(total_stake, cfg["min_bet"])
 
     # Translate total stake to contracts, then split into legs
@@ -65,7 +90,9 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
     net_profit = round(gross_profit - fees["worst_case_total"], 2)
     net_profit_pct = round(net_profit / total_stake, 4) if total_stake > 0 else 0.0
 
-    limiting_rule = _find_limiting_rule(kelly_stake, bankroll_cap, liquidity_cap, cfg["max_bet"])
+    limiting_rule = _find_limiting_rule(
+        kelly_stake, bankroll_cap, liquidity_cap, book_depth_cap, cfg["max_bet"],
+    )
 
     return {
         "bet_size": round(total_stake, 2),  # total $ committed across both legs
@@ -91,16 +118,21 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
             "kelly_fractional": round(kelly_stake, 2),
             "bankroll_pct": round(bankroll_cap, 2),
             "liquidity_pct": round(liquidity_cap, 2),
+            "book_depth": round(book_depth_cap, 2),
             "max_bet": cfg["max_bet"],
         },
     }
 
 
-def _find_limiting_rule(kelly: float, bankroll: float, liquidity: float, max_bet: float) -> str:
+def _find_limiting_rule(
+    kelly: float, bankroll: float, liquidity: float,
+    book_depth: float, max_bet: float,
+) -> str:
     caps = {
         "kelly_fractional": kelly,
         "bankroll_pct": bankroll,
         "liquidity_pct": liquidity,
+        "book_depth": book_depth,
         "max_bet": max_bet,
     }
     return min(caps, key=lambda k: caps[k])

@@ -24,6 +24,14 @@ Wording differences that DO NOT matter (still match):
 - Multi-outcome Kalshi event ("Who will IPO before 2027? – Kraken") matching a binary
   Polymarket question ("Kraken IPO by Dec 31, 2026?") — these ARE legitimate arbs as long
   as the date window matches.
+- INVERSE PHRASING. "Will X NOT happen by Y?" matches "Who will happen? – X" with the
+  SAME date Y, because YES on the negative-phrased market resolves true exactly when the
+  positive one resolves false. Example: "Will OpenAI not IPO by December 31, 2026?" MATCHES
+  "Who will IPO before 2027? – OpenAI" — these resolve on the same OpenAI-IPO event.
+- INVERSE PARTY phrasing. "Will Republicans win [seat]?" matches "Will Democratics win
+  [same seat]? – Democratic party" — these are the same head-to-head race; YES on one
+  is NO on the other. The two-party race is a binary outcome regardless of which side
+  the question asks about.
 
 Mark is_match=FALSE when:
 - Different thresholds or time windows ("BTC > $100k by Dec 31" vs "BTC > $100k by Jan 31").

@@ -33,8 +33,15 @@ polymarket:
   rate_limit_per_min: 120
 
 matching:
-  similarity_threshold: 65     # rapidfuzz token_sort_ratio minimum (0-100) — broad net, LLM filters false matches
+  similarity_threshold: 55     # rapidfuzz token_sort_ratio minimum (0-100) — broad net, LLM filters false matches.
+                               # Lowered from 65 (2026-04-30) so inverse-phrased pairs ("X not happens" vs "X happens")
+                               # reach the LLM. Anchor-token bypass (matcher) ALSO catches sub-threshold pairs that
+                               # share ≥3 distinctive tokens (e.g. proper nouns), so the effective floor is much lower.
   expiry_proximity_hours: 72   # markets must close within this window of each other
+  anchor_min_shared: 2         # tier-2 anchor-token bypass minimum shared distinctive tokens.
+                               # Set to 2 so "Will OpenAI not IPO" + "Who will IPO – OpenAI"
+                               # qualifies on {openai, ipo}. LLM filters false positives like
+                               # "Trump visits France" vs "Trump visits Italy" (also 2 shared).
 
 llm:
   enabled: true                # set false to skip LLM and use fuzzy match alone
@@ -42,7 +49,9 @@ llm:
   api_key_env: "ANTHROPIC_API_KEY"
   model: "claude-haiku-4-5-20251001"   # cheap + fast; bump to sonnet for tougher cases
   cache_hours: 24              # re-verify a pair only after this long
-  max_pairs_per_cycle: 200     # bumped from 50 — w/o multi-outcome filter, more pairs flow
+  max_pairs_per_cycle: 400     # bumped from 200 (2026-04-30): with lower fuzz threshold + anchor bypass,
+                               # more candidate pairs flow. 24h LLM cache makes this cheap after first cycle —
+                               # only NEW pairs hit the API; previously-verified ones return instantly from DB.
 
 filters:
   min_volume: 500              # DIAGNOSTIC: temporarily lowered from 5000 to validate pipeline.
@@ -67,6 +76,11 @@ sizing:
   max_bet: 500
   kelly_fraction: 0.25         # quarter-Kelly (conservative; tune up as you gain confidence)
   liquidity_cap_pct: 0.10      # don't take more than 10% of available market volume
+  book_depth_fraction: 0.25    # entry leg-USD ≤ this fraction of unwind-side bid depth.
+                               # Stops phantom MTM losses by ensuring positions can be
+                               # exited at top-of-book. With 0.25, a market with $40 of
+                               # bid depth → $10 entry per leg. The user's "$10 → $1 is
+                               # fine" principle: small in shallow books, larger in deep.
 
 fees:
   kalshi_fee_rate: 0.07              # Kalshi: ceil(rate × N × p × (1-p)) cents per contract

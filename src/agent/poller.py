@@ -137,10 +137,12 @@ class PollingAgent:
             p_markets,
             similarity_threshold=self.cfg["matching"]["similarity_threshold"],
             expiry_proximity_hours=self.cfg["matching"]["expiry_proximity_hours"],
+            anchor_min_shared=int(self.cfg["matching"].get("anchor_min_shared", 3)),
         )
 
         verified_pairs = await self._verify_pairs(pairs)
         verified_pairs = await self._refresh_polymarket_clob(verified_pairs)
+        verified_pairs = await self._fetch_kalshi_books(verified_pairs)
 
         raw_opps = []
         for a, b in verified_pairs:
@@ -195,9 +197,11 @@ class PollingAgent:
             )
             if mon["n_open"] > 0:
                 log.info(
-                    "Monitor: open=%d marked=%d EXIT=%d WATCH=%d HOLD=%d skipped=%d",
-                    mon["n_open"], mon["n_marked"], mon["exits"],
+                    "Monitor: open=%d marked=%d UNWIND=%d CLOSED=%d WATCH=%d HOLD=%d skipped=%d realized_this_cycle=$%.2f",
+                    mon["n_open"], mon["n_marked"],
+                    mon["partial_unwinds"], mon["fully_closed"],
                     mon["watches"], mon["holds"], mon["skipped"],
+                    mon["realized_this_cycle"],
                 )
         except Exception as e:
             log.error("Position monitor error: %s", e, exc_info=True)
@@ -214,6 +218,11 @@ class PollingAgent:
         (observed 16¢ discrepancy on Juventus). Without this, half our
         'arbs' are phantoms based on stale displayed prices. Run this AFTER
         LLM verification so we only burn CLOB calls on real candidates.
+
+        Also captures bid-side depth (yes_bid_depth_usd / no_bid_depth_usd)
+        on the SAME side as our entry — that's the unwind side later, used
+        by the sizing engine to cap bets at a fraction of the bid book so
+        positions remain exitable at top-of-book without slippage.
         """
         async def refresh_market(m: dict) -> dict:
             if m.get("platform") != "polymarket":
@@ -225,12 +234,16 @@ class PollingAgent:
             if yes_ask <= 0 or no_ask <= 0:
                 # CLOB unavailable — keep Gamma price but flag low confidence
                 return m
+            yes_bid, yes_bid_size = self.poly.best_bid_from_book(yes_book)
+            no_bid,  no_bid_size  = self.poly.best_bid_from_book(no_book)
             return {
                 **m,
                 "yes_price": round(yes_ask, 4),
                 "no_price": round(no_ask, 4),
                 "yes_ask_depth_usd": round(yes_ask_size * yes_ask, 2),
                 "no_ask_depth_usd": round(no_ask_size * no_ask, 2),
+                "yes_bid_depth_usd": round(yes_bid_size * yes_bid, 2) if yes_bid > 0 else 0.0,
+                "no_bid_depth_usd": round(no_bid_size * no_bid, 2) if no_bid > 0 else 0.0,
                 "_clob_refreshed": True,
             }
 
@@ -252,6 +265,53 @@ class PollingAgent:
             rebuilt.append((a2, b2))
         n_refreshed = sum(1 for m in refreshed if m.get("_clob_refreshed"))
         log.info("CLOB refresh: %d/%d Polymarket legs updated with live order book", n_refreshed, len(unique_markets))
+        return rebuilt
+
+    async def _fetch_kalshi_books(self, pairs):
+        """Attach yes/no bid-depth to Kalshi legs of verified pairs.
+
+        Kalshi's market metadata gives us best ASK price + size (what we'd
+        pay to enter), but no bid-side depth. The sizing engine needs bid
+        depth on the leg we'll later sell back into to cap entry size at a
+        fraction of the unwind book — otherwise we open positions we can't
+        exit cleanly. Runs only on verified pairs so we don't burn the
+        rate limit on rejected candidates.
+        """
+        async def fetch_one(m: dict) -> dict:
+            if m.get("platform") != "kalshi":
+                return m
+            book = await self.kalshi.fetch_orderbook(m.get("ticker") or "")
+            if not book:
+                return m
+            yes_bids = book.get("yes_bids", [])
+            no_bids = book.get("no_bids", [])
+            yes_bid_depth = round(sum(p * s for p, s in yes_bids[:3]), 2)
+            no_bid_depth = round(sum(p * s for p, s in no_bids[:3]), 2)
+            return {
+                **m,
+                "yes_bid_depth_usd": yes_bid_depth,
+                "no_bid_depth_usd": no_bid_depth,
+                "_kalshi_book_fetched": True,
+            }
+
+        # Dedupe by ticker — one market may appear in multiple verified pairs.
+        unique: dict[str, dict] = {}
+        for a, b in pairs:
+            for m in (a, b):
+                if m.get("platform") == "kalshi":
+                    unique.setdefault(m["ticker"], m)
+        if not unique:
+            return pairs
+        refreshed = await asyncio.gather(*[fetch_one(m) for m in unique.values()])
+        by_ticker = {m["ticker"]: m for m in refreshed}
+
+        rebuilt = []
+        for a, b in pairs:
+            a2 = by_ticker.get(a.get("ticker"), a) if a.get("platform") == "kalshi" else a
+            b2 = by_ticker.get(b.get("ticker"), b) if b.get("platform") == "kalshi" else b
+            rebuilt.append((a2, b2))
+        n_fetched = sum(1 for m in refreshed if m.get("_kalshi_book_fetched"))
+        log.info("Kalshi book fetch: %d/%d markets got bid-depth", n_fetched, len(unique))
         return rebuilt
 
     async def _run_lag_detection(self, k_markets: list[dict]) -> None:

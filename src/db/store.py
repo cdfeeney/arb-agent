@@ -190,6 +190,38 @@ class Database:
             # back to "no book available" for them, same behavior as before).
             await self._maybe_add_column(db, "paper_trades", "yes_token", "TEXT")
             await self._maybe_add_column(db, "paper_trades", "no_token", "TEXT")
+
+            # Partial-unwind tracking. Each cycle the monitor may sell a slice
+            # of an open position at top-of-book if both legs' top bids sum
+            # above cost-per-contract. We track:
+            #   contracts_remaining   = how many contracts of the original
+            #                            hedge are still open
+            #   partial_realized_usd  = cumulative realized profit from
+            #                            partial unwinds so far
+            # When contracts_remaining hits 0 the trade transitions to
+            # status='closed' and realized_profit_usd = partial_realized_usd.
+            await self._maybe_add_column(
+                db, "paper_trades", "contracts_remaining", "REAL",
+            )
+            await self._maybe_add_column(
+                db, "paper_trades", "partial_realized_usd", "REAL DEFAULT 0",
+            )
+            # Backfill contracts_remaining for legacy rows: assume the original
+            # hedge size still holds (no historical partial unwinds before
+            # this feature shipped).
+            await db.execute(
+                "UPDATE paper_trades SET contracts_remaining = yes_contracts "
+                "WHERE contracts_remaining IS NULL"
+            )
+
+            # paper_trade_marks: track per-cycle partial unwinds so backtest
+            # scripts can replay convergence behavior leg-by-leg.
+            await self._maybe_add_column(
+                db, "paper_trade_marks", "partial_unwind_size", "REAL",
+            )
+            await self._maybe_add_column(
+                db, "paper_trade_marks", "partial_unwind_realized_usd", "REAL",
+            )
             await db.commit()
         log.info(f"Database ready: {self.path}")
 
@@ -286,8 +318,9 @@ class Database:
                     no_observed_price, no_size_usd, no_contracts,
                     yes_token, no_token,
                     edge_gross_pct, implied_sum, fees_estimated_usd,
-                    predicted_net_usd, predicted_net_pct, status
-                ) VALUES (?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?, ?,?, ?,?,?, ?,?, 'open')""",
+                    predicted_net_usd, predicted_net_pct,
+                    contracts_remaining, partial_realized_usd, status
+                ) VALUES (?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?, ?,?, ?,?,?, ?,?, ?,0, 'open')""",
                 (
                     opp["pair_id"], closes_at.isoformat() if closes_at else None,
                     yes["platform"], yes["ticker"], yes["question"], yes["url"],
@@ -297,6 +330,7 @@ class Database:
                     yes_token, no_token,
                     opp["profit_pct"], opp["implied_sum"], fees.get("worst_case_total", 0),
                     sizing["net_profit"], sizing["net_profit_pct"],
+                    sizing["leg_yes"]["contracts"],
                 ),
             )
             await db.commit()
@@ -471,11 +505,13 @@ class Database:
                     mark_to_market_usd, convergence_ratio, slippage_pct,
                     days_held, days_remaining,
                     annualized_now_pct, annualized_to_close_pct,
-                    exit_recommendation, decision_reason
+                    exit_recommendation, decision_reason,
+                    partial_unwind_size, partial_unwind_realized_usd
                 ) VALUES (?,
                           ?,?,?, ?,?,?,
                           ?,?,?, ?,?,?,
                           ?,?, ?,?,
+                          ?,?,
                           ?,?)""",
                 (
                     mark["paper_trade_id"],
@@ -490,6 +526,8 @@ class Database:
                     mark.get("days_held"), mark.get("days_remaining"),
                     mark.get("annualized_now_pct"), mark.get("annualized_to_close_pct"),
                     mark.get("exit_recommendation"), mark.get("decision_reason"),
+                    mark.get("partial_unwind_size"),
+                    mark.get("partial_unwind_realized_usd"),
                 ),
             )
             await db.commit()
@@ -512,6 +550,62 @@ class Database:
                 ),
             )
             await db.commit()
+
+    async def apply_partial_unwind(
+        self,
+        trade_id: int,
+        unwind_size: float,
+        realized_usd: float,
+    ) -> dict:
+        """Decrement contracts_remaining + accumulate partial realized profit.
+
+        Returns the post-update {contracts_remaining, partial_realized_usd,
+        fully_closed} so the caller can decide whether to close the trade.
+
+        Atomic in a single transaction so concurrent monitor cycles can't
+        race-condition the same trade into negative remainders.
+        """
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT contracts_remaining, partial_realized_usd "
+                "FROM paper_trades WHERE id=? AND status='open'",
+                (trade_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return {"contracts_remaining": 0, "partial_realized_usd": 0,
+                        "fully_closed": True}
+            cur_remaining = float(row["contracts_remaining"] or 0)
+            cur_realized = float(row["partial_realized_usd"] or 0)
+            new_remaining = max(0.0, cur_remaining - unwind_size)
+            new_realized = round(cur_realized + realized_usd, 4)
+            fully_closed = new_remaining <= 0.0001  # float tolerance
+            if fully_closed:
+                await db.execute(
+                    """UPDATE paper_trades SET
+                           contracts_remaining=0,
+                           partial_realized_usd=?,
+                           realized_profit_usd=?,
+                           status='closed',
+                           resolved_at=?
+                       WHERE id=?""",
+                    (new_realized, new_realized,
+                     datetime.now(timezone.utc).isoformat(), trade_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE paper_trades SET "
+                    "contracts_remaining=?, partial_realized_usd=? "
+                    "WHERE id=?",
+                    (round(new_remaining, 4), new_realized, trade_id),
+                )
+            await db.commit()
+            return {
+                "contracts_remaining": round(new_remaining, 4),
+                "partial_realized_usd": new_realized,
+                "fully_closed": fully_closed,
+            }
 
     async def add_pair_cooldown(self, pair_id: str, reason: str) -> None:
         async with aiosqlite.connect(self.path) as db:

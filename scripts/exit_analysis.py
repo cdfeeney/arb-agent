@@ -93,6 +93,9 @@ async def main() -> None:
         cur = await db.execute(
             """SELECT pt.id, pt.pair_id, pt.predicted_net_usd, pt.status,
                       pt.yes_size_usd + pt.no_size_usd                AS cost,
+                      pt.partial_realized_usd                         AS partial_realized,
+                      pt.contracts_remaining                          AS remaining,
+                      pt.yes_contracts                                AS orig_contracts,
                       MAX(m.locked_payout_usd) - (pt.yes_size_usd + pt.no_size_usd)
                                                                        AS hold_pnl,
                       MAX(m.mark_to_market_usd)                       AS max_mtm,
@@ -105,11 +108,18 @@ async def main() -> None:
         )
         for r in await cur.fetchall():
             hold = r["hold_pnl"] if r["hold_pnl"] is not None else 0.0
+            partial = r["partial_realized"] or 0.0
+            orig = r["orig_contracts"] or 0
+            remaining = r["remaining"] if r["remaining"] is not None else orig
+            unwound_pct = (
+                (orig - remaining) / orig * 100 if orig > 0 else 0.0
+            )
             print(
                 f"  #{r['id']:>4}  status={r['status']:<8} "
                 f"cost=${(r['cost'] or 0):>6.2f}  "
                 f"pred=${r['predicted_net_usd']:>6.2f}  "
                 f"hold=${hold:>6.2f}  "
+                f"partial=${partial:>5.2f} ({unwound_pct:>4.0f}% unwound)  "
                 f"mtm=[{(r['min_mtm'] or 0):>7.2f}..{(r['max_mtm'] or 0):>7.2f}]"
             )
             print(f"    {r['pair_id'][:80]}")

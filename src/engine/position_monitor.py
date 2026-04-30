@@ -35,6 +35,7 @@ class ExitConfig:
     max_slippage_pct: float             # if slippage > this, downgrade EXIT to HOLD
     cooldown_minutes: int               # re-entry cooldown after exit
     min_days_remaining_to_force_hold: float  # very-near-resolution: hold
+    partial_unwind_min_size: float      # smallest unwind worth executing (contracts)
 
     @classmethod
     def from_dict(cls, d: dict) -> "ExitConfig":
@@ -47,12 +48,14 @@ class ExitConfig:
             min_days_remaining_to_force_hold=float(
                 d.get("min_days_remaining_to_force_hold", 0.5)
             ),
+            partial_unwind_min_size=float(d.get("partial_unwind_min_size", 1.0)),
         )
 
 
 @dataclass
 class LegMark:
     best_bid: float
+    best_bid_size: float
     vwap_bid: float
     fill_contracts: float
     target_contracts: float
@@ -65,6 +68,8 @@ class TradeMark:
     yes_leg: LegMark
     no_leg: LegMark
     cost_basis: float
+    cost_per_contract: float
+    contracts_remaining: float
     unwind_value: float
     locked_payout: float          # = sum(contracts) since one leg pays $1
     mark_to_market: float
@@ -77,6 +82,8 @@ class TradeMark:
     annualized_to_close_pct: float
     recommendation: str
     reason: str
+    partial_unwind_size: float = 0.0
+    partial_unwind_realized: float = 0.0
 
 
 def _parse_dt(s: str | datetime | None) -> Optional[datetime]:
@@ -99,13 +106,13 @@ async def _bid_mark_kalshi(
     """side: 'yes' or 'no'. Returns the bid-side liquidation profile."""
     book = await kalshi.fetch_orderbook(ticker)
     if not book:
-        return LegMark(0.0, 0.0, 0.0, contracts, False)
+        return LegMark(0.0, 0.0, 0.0, 0.0, contracts, False)
     bids = book.get(f"{side}_bids", [])
     if not bids:
-        return LegMark(0.0, 0.0, 0.0, contracts, False)
-    best_bid = bids[0][0]
+        return LegMark(0.0, 0.0, 0.0, 0.0, contracts, False)
+    best_bid, best_bid_size = bids[0][0], bids[0][1]
     vwap, filled = KalshiClient.walk_bids(bids, contracts)
-    return LegMark(best_bid, vwap, filled, contracts, True)
+    return LegMark(best_bid, best_bid_size, vwap, filled, contracts, True)
 
 
 async def _bid_mark_polymarket(
@@ -113,73 +120,88 @@ async def _bid_mark_polymarket(
 ) -> LegMark:
     book = await poly.fetch_clob_book(token_id)
     if not book:
-        return LegMark(0.0, 0.0, 0.0, contracts, False)
-    best_bid, _ = PolymarketClient.best_bid_from_book(book)
+        return LegMark(0.0, 0.0, 0.0, 0.0, contracts, False)
+    best_bid, best_bid_size = PolymarketClient.best_bid_from_book(book)
     vwap, filled = PolymarketClient.walk_bids(book, contracts)
-    return LegMark(best_bid, vwap, filled, contracts, best_bid > 0)
+    return LegMark(best_bid, best_bid_size, vwap, filled, contracts, best_bid > 0)
 
 
 def _decide(
     mark: TradeMark, cfg: ExitConfig,
-) -> tuple[str, str]:
-    """Pure-function exit decision.
+) -> tuple[str, str, float]:
+    """Pure-function exit decision returning (recommendation, reason, unwind_size).
 
-    Returns (recommendation, reason). Recommendation is one of:
-        EXIT   — recommend unwinding both legs now
-        WATCH  — close to a trigger; log but do not exit
-        HOLD   — keep position to resolution
+    Recommendation is one of:
+        PARTIAL_UNWIND — sell `unwind_size` contracts on each leg at top-of-book
+                          right now (zero slippage by construction)
+        WATCH          — top-of-book breakeven but books too thin to act this cycle
+        HOLD           — keep position; no favorable unwind available
+
+    The strategy: each cycle, check if the SUM of best bids on YES leg and
+    NO leg exceeds the per-contract cost we paid. If so, we can sell some
+    number of contracts on each leg at the top of the bid book and lock in
+    profit IMMEDIATELY with zero slippage. Size = min of (yes top-bid size,
+    no top-bid size, contracts remaining). Capture profit, hold remainder for
+    later cycles or resolution. Books may refresh and offer another partial
+    unwind on the next cycle.
     """
     if not cfg.enabled:
-        return "HOLD", "monitor disabled"
+        return "HOLD", "monitor disabled", 0.0
 
-    # Force-hold near resolution; the spread cost likely exceeds the
-    # annualized-return benefit of an early exit when resolution is hours away.
+    if mark.contracts_remaining <= 0:
+        return "HOLD", "fully unwound", 0.0
+
+    # Force-hold near resolution: the spread cost on a partial unwind likely
+    # exceeds the annualized-return benefit when resolution is hours away.
     if mark.days_remaining < cfg.min_days_remaining_to_force_hold:
-        return "HOLD", f"resolves in {mark.days_remaining:.2f}d, hold for full payout"
+        return "HOLD", f"resolves in {mark.days_remaining:.2f}d, hold for full payout", 0.0
 
-    # If neither leg has a usable bid book, we couldn't exit even if we wanted to.
+    # Either bid book unavailable → can't unwind either leg.
     if not mark.yes_leg.book_available or not mark.no_leg.book_available:
-        return "HOLD", "missing bid book on at least one leg"
+        return "HOLD", "missing bid book on at least one leg", 0.0
 
-    # Slippage gate: if walking the book to our size would cost > threshold,
-    # downgrade any EXIT to a HOLD with a flag — the bid book is too thin.
-    if mark.slippage_pct > cfg.max_slippage_pct:
+    yes_bid = mark.yes_leg.best_bid
+    no_bid = mark.no_leg.best_bid
+    if yes_bid <= 0 or no_bid <= 0:
+        return "HOLD", "zero best-bid on at least one leg", 0.0
+
+    # Profitability test: can we sell ONE contract on each leg at top-of-book
+    # for more than we paid per pair? If yes_bid + no_bid > cost_per_contract,
+    # every unwound contract realizes (yes_bid + no_bid - cost_per_contract).
+    sum_bids = yes_bid + no_bid
+    profit_per_contract = sum_bids - mark.cost_per_contract
+    if profit_per_contract <= 0:
         return (
             "HOLD",
-            f"thin book: slippage {mark.slippage_pct*100:.2f}% > "
-            f"{cfg.max_slippage_pct*100:.2f}% threshold",
+            f"top bids {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} ≤ cost "
+            f"{mark.cost_per_contract:.4f}",
+            0.0,
         )
 
-    # Trigger 1: convergence captured ≥ threshold.
-    if mark.convergence_ratio >= cfg.convergence_threshold:
-        return (
-            "EXIT",
-            f"convergence={mark.convergence_ratio*100:.1f}% "
-            f">= {cfg.convergence_threshold*100:.0f}%",
-        )
+    # Sizing: take the smaller of (yes top-of-book size, no top-of-book size,
+    # contracts still held). Selling more than top-of-book size on either leg
+    # would walk the book and lose the zero-slippage guarantee.
+    raw_size = min(
+        mark.yes_leg.best_bid_size,
+        mark.no_leg.best_bid_size,
+        mark.contracts_remaining,
+    )
 
-    # Trigger 2: annualized-now beats annualized-if-held by required multiple.
-    # Only meaningful when annualized_to_close_pct > 0 (otherwise division would
-    # be weird; we already mark-to-market into negatives explicitly).
-    if (
-        mark.annualized_to_close_pct > 0
-        and mark.annualized_now_pct
-        > mark.annualized_to_close_pct * cfg.annualized_multiple
-    ):
-        return (
-            "EXIT",
-            f"annualized {mark.annualized_now_pct:.1f}% > "
-            f"{cfg.annualized_multiple:.1f}× hold {mark.annualized_to_close_pct:.1f}%",
-        )
-
-    # Within 80% of the convergence trigger — log for analysis but don't act.
-    if mark.convergence_ratio >= cfg.convergence_threshold * 0.8:
+    if raw_size < cfg.partial_unwind_min_size:
         return (
             "WATCH",
-            f"convergence={mark.convergence_ratio*100:.1f}% near threshold",
+            f"profitable unwind sized {raw_size:.2f} below min "
+            f"{cfg.partial_unwind_min_size:.2f} — wait for thicker book",
+            raw_size,
         )
 
-    return "HOLD", "no trigger met"
+    return (
+        "PARTIAL_UNWIND",
+        f"top-of-book {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} > "
+        f"cost {mark.cost_per_contract:.4f}, sell {raw_size:.2f} contracts "
+        f"@ ${profit_per_contract*raw_size:.2f}",
+        raw_size,
+    )
 
 
 async def monitor_open_positions(
@@ -193,10 +215,12 @@ async def monitor_open_positions(
     summary = {
         "n_open": 0,
         "n_marked": 0,
-        "exits": 0,
+        "partial_unwinds": 0,
+        "fully_closed": 0,
         "watches": 0,
         "holds": 0,
         "skipped": 0,
+        "realized_this_cycle": 0.0,
     }
     if not cfg.enabled:
         return summary
@@ -212,9 +236,19 @@ async def monitor_open_positions(
             if mark is None:
                 summary["skipped"] += 1
                 continue
-            recommendation, reason = _decide(mark, cfg)
+            recommendation, reason, unwind_size = _decide(mark, cfg)
             mark.recommendation = recommendation
             mark.reason = reason
+
+            partial_realized = 0.0
+            if recommendation == "PARTIAL_UNWIND" and unwind_size > 0:
+                profit_per_contract = (
+                    mark.yes_leg.best_bid + mark.no_leg.best_bid
+                    - mark.cost_per_contract
+                )
+                partial_realized = round(profit_per_contract * unwind_size, 4)
+                mark.partial_unwind_size = unwind_size
+                mark.partial_unwind_realized = partial_realized
 
             await db.save_paper_trade_mark({
                 "paper_trade_id": mark.paper_trade_id,
@@ -236,25 +270,42 @@ async def monitor_open_positions(
                 "annualized_to_close_pct": round(mark.annualized_to_close_pct, 2),
                 "exit_recommendation": recommendation,
                 "decision_reason": reason,
+                "partial_unwind_size": (
+                    round(mark.partial_unwind_size, 4)
+                    if mark.partial_unwind_size > 0 else None
+                ),
+                "partial_unwind_realized_usd": (
+                    partial_realized if mark.partial_unwind_size > 0 else None
+                ),
             })
             summary["n_marked"] += 1
 
-            if recommendation == "EXIT":
-                summary["exits"] += 1
+            if recommendation == "PARTIAL_UNWIND":
+                summary["partial_unwinds"] += 1
+                summary["realized_this_cycle"] += partial_realized
                 log.info(
-                    "EXIT trade #%d: %s | mtm=$%.2f conv=%.1f%% slip=%.2f%% | %s",
+                    "PARTIAL_UNWIND trade #%d: %s | sold %.1f@$%.4f → realized $%.2f (cum partial=$%.2f) | %s",
                     trade["id"], trade["pair_id"][:60],
-                    mark.mark_to_market, mark.convergence_ratio * 100,
-                    mark.slippage_pct * 100, reason,
+                    unwind_size,
+                    mark.yes_leg.best_bid + mark.no_leg.best_bid,
+                    partial_realized,
+                    float(trade.get("partial_realized_usd") or 0) + partial_realized,
+                    reason,
                 )
                 if dry_run:
-                    # Paper-mode: record the exit + cooldown without calling APIs.
-                    await db.mark_paper_trade_exited(
-                        trade["id"], mark.mark_to_market, reason,
+                    result = await db.apply_partial_unwind(
+                        trade["id"], unwind_size, partial_realized,
                     )
-                    await db.add_pair_cooldown(
-                        trade["pair_id"], f"paper-exit: {reason}",
-                    )
+                    if result["fully_closed"]:
+                        summary["fully_closed"] += 1
+                        log.info(
+                            "CLOSED trade #%d: %s | total realized $%.2f",
+                            trade["id"], trade["pair_id"][:60],
+                            result["partial_realized_usd"],
+                        )
+                        await db.add_pair_cooldown(
+                            trade["pair_id"], f"paper-closed: realized ${result['partial_realized_usd']:.2f}",
+                        )
             elif recommendation == "WATCH":
                 summary["watches"] += 1
                 log.info(
@@ -276,49 +327,63 @@ async def _build_mark(
 ) -> Optional[TradeMark]:
     yes_platform = trade["yes_platform"]
     yes_ticker = trade["yes_ticker"]
-    yes_contracts = float(trade["yes_contracts"] or 0)
+    yes_contracts_orig = float(trade["yes_contracts"] or 0)
     yes_paid = float(trade["yes_observed_price"] or 0)
     yes_size_usd = float(trade["yes_size_usd"] or 0)
 
     no_platform = trade["no_platform"]
     no_ticker = trade["no_ticker"]
-    no_contracts = float(trade["no_contracts"] or 0)
+    no_contracts_orig = float(trade["no_contracts"] or 0)
     no_paid = float(trade["no_observed_price"] or 0)
     no_size_usd = float(trade["no_size_usd"] or 0)
 
-    if yes_contracts <= 0 or no_contracts <= 0:
+    if yes_contracts_orig <= 0 or no_contracts_orig <= 0:
+        return None
+
+    # contracts_remaining tracks live position size; fall back to original
+    # for legacy rows backfilled with NULL → original by the migration.
+    contracts_remaining = float(
+        trade.get("contracts_remaining")
+        if trade.get("contracts_remaining") is not None
+        else yes_contracts_orig
+    )
+    if contracts_remaining <= 0:
         return None
 
     yes_token = trade.get("yes_token")
     no_token = trade.get("no_token")
 
-    # Fetch bid books for whichever side each leg lives on.
+    # Fetch bid books for whichever side each leg lives on. Walk to
+    # contracts_remaining (not original) since that's our actual live size.
     if yes_platform == "kalshi":
-        yes_mark = await _bid_mark_kalshi(kalshi, yes_ticker, "yes", yes_contracts)
+        yes_mark = await _bid_mark_kalshi(kalshi, yes_ticker, "yes", contracts_remaining)
     elif yes_platform == "polymarket" and yes_token:
-        yes_mark = await _bid_mark_polymarket(poly, yes_token, yes_contracts)
+        yes_mark = await _bid_mark_polymarket(poly, yes_token, contracts_remaining)
     else:
         # Polymarket leg without a stored token (older row from before the
         # token-capture migration) — can't price the unwind, fall through
         # as "book unavailable" so monitor refuses to recommend exit.
-        yes_mark = LegMark(0.0, 0.0, 0.0, yes_contracts, False)
+        yes_mark = LegMark(0.0, 0.0, 0.0, 0.0, contracts_remaining, False)
 
     if no_platform == "kalshi":
-        no_mark = await _bid_mark_kalshi(kalshi, no_ticker, "no", no_contracts)
+        no_mark = await _bid_mark_kalshi(kalshi, no_ticker, "no", contracts_remaining)
     elif no_platform == "polymarket" and no_token:
-        no_mark = await _bid_mark_polymarket(poly, no_token, no_contracts)
+        no_mark = await _bid_mark_polymarket(poly, no_token, contracts_remaining)
     else:
-        no_mark = LegMark(0.0, 0.0, 0.0, no_contracts, False)
+        no_mark = LegMark(0.0, 0.0, 0.0, 0.0, contracts_remaining, False)
 
-    cost_basis = yes_size_usd + no_size_usd
+    # Cost basis: per the original entry, prorated to remaining contracts.
+    # The actual paid-per-contract is fixed at entry; remaining cost basis
+    # = remaining × cost_per_contract.
+    cost_per_contract = yes_paid + no_paid
+    cost_basis = contracts_remaining * cost_per_contract
     unwind_value = (
         yes_mark.vwap_bid * yes_mark.fill_contracts
         + no_mark.vwap_bid * no_mark.fill_contracts
     )
-    # Locked payout: at resolution one leg pays $1/contract for whichever
-    # side wins. With perfectly hedged contract counts we receive
-    # min(yes_contracts, no_contracts) × $1.
-    locked_payout = min(yes_contracts, no_contracts) * 1.0
+    # Locked payout: at resolution one leg pays $1/contract for whichever side
+    # wins, on the contracts still held.
+    locked_payout = contracts_remaining * 1.0
     locked_profit_at_resolution = locked_payout - cost_basis
     mark_to_market = unwind_value - cost_basis
 
@@ -369,6 +434,8 @@ async def _build_mark(
         yes_leg=yes_mark,
         no_leg=no_mark,
         cost_basis=cost_basis,
+        cost_per_contract=cost_per_contract,
+        contracts_remaining=contracts_remaining,
         unwind_value=unwind_value,
         locked_payout=locked_payout,
         mark_to_market=mark_to_market,
