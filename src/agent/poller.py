@@ -283,16 +283,24 @@ class PollingAgent:
         Returns the subset where the LLM confirmed both markets resolve on the
         same underlying event. If the verifier is disabled, returns pairs as-is.
         Cap is applied per cycle to bound API cost.
+
+        Calls fire concurrently bounded by the verifier's internal semaphore.
+        Cache hits (24h cache_hours by default) return instantly without
+        an API round-trip, so cycles after the first are dominated by genuine
+        new pairs rather than re-verifying yesterday's matches.
         """
         if not self.verifier or not pairs:
             return pairs
         cap = int(self.cfg.get("llm", {}).get("max_pairs_per_cycle", 50))
+        capped = pairs[:cap]
+        if len(pairs) > cap:
+            log.info("LLM cap reached (%d) — %d pairs unverified", cap, len(pairs) - cap)
+        results = await asyncio.gather(
+            *[self.verifier.verify(a, b) for a, b in capped],
+            return_exceptions=True,
+        )
         verified = []
-        for i, (a, b) in enumerate(pairs):
-            if i >= cap:
-                log.info("LLM cap reached (%d) — %d pairs unverified", cap, len(pairs) - cap)
-                break
-            ok = await self.verifier.verify(a, b)
-            if ok:
+        for (a, b), ok in zip(capped, results):
+            if ok is True:  # explicit True only — None/False/Exception → skip
                 verified.append((a, b))
         return verified

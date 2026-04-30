@@ -53,12 +53,17 @@ class LLMVerifier:
         api_key: str,
         model: str = "claude-haiku-4-5-20251001",
         cache_hours: int = 24,
+        max_concurrency: int = 10,
     ):
         self.db = db
         self.api_key = api_key
         self.model = model
         self.cache_hours = cache_hours
         self._client = None
+        # Bounded concurrency for the API. Anthropic Haiku tier handles
+        # well above 10 concurrent requests; cap conservatively to stay
+        # within rate limits and avoid spamming on retry storms.
+        self._semaphore = asyncio.Semaphore(max_concurrency)
 
     def _get_client(self):
         if self._client is None:
@@ -82,9 +87,10 @@ class LLMVerifier:
         )
 
         try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, self._call_anthropic, prompt
-            )
+            async with self._semaphore:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, self._call_anthropic, prompt
+                )
         except Exception as e:
             log.warning("LLM verify failed for %s: %s", pair_id, e)
             return None
