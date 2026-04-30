@@ -20,14 +20,30 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.clients.polymarket import PolymarketClient
-from src.clients.polymarket_us import PolymarketUSClient
-from src.config import load_config
+# Load .env so POLYMARKET_US_KEY_ID / POLYMARKET_US_SECRET_KEY are available
+# when running this script standalone (the bot's main.py loads it via systemd
+# already, but `python -m scripts.X` doesn't go through main).
+from dotenv import load_dotenv  # noqa: E402
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+from src.clients.polymarket import PolymarketClient  # noqa: E402
+from src.clients.polymarket_us import PolymarketUSClient  # noqa: E402
+from src.config import load_config  # noqa: E402
+
+
+# Polymarket US is CFTC-regulated; doesn't list state-regulated sports books.
+# Filter to categories we expect to exist on both sides.
+US_LIKELY_CATEGORIES = {
+    "politics", "elections", "economics", "finance", "crypto",
+    "tech", "geopolitics", "world", "mentions", "culture", "weather",
+}
+US_UNLIKELY_CATEGORIES = {"sports"}
 
 
 async def main() -> None:
@@ -50,8 +66,22 @@ async def main() -> None:
     print(f"\n=== Polymarket US vs International Price Diff ===\n")
     print(
         f"US client authenticated: {poly_us.authenticated}  "
-        f"(read-only diff still works without creds)\n"
+        f"(read-only diff still works without creds)"
     )
+    if not poly_us.authenticated:
+        # Diagnostic: did .env at least have the variables?
+        kid = os.environ.get("POLYMARKET_US_KEY_ID", "")
+        sec = os.environ.get("POLYMARKET_US_SECRET_KEY", "")
+        print(
+            f"  Diagnostic: POLYMARKET_US_KEY_ID set={bool(kid)} (len={len(kid)}), "
+            f"POLYMARKET_US_SECRET_KEY set={bool(sec)} (len={len(sec)})"
+        )
+        if not kid or not sec:
+            print(
+                "  -> .env not found or missing POLYMARKET_US_* keys. "
+                "Add them to /root/arb-agent/.env"
+            )
+    print()
 
     slugs: list[str]
     intl_markets: dict[str, dict] = {}
@@ -71,12 +101,22 @@ async def main() -> None:
                     break
     else:
         candidates = await poly_intl.fetch_markets(
-            limit=50, max_markets=50,
+            limit=200, max_markets=200,
             max_days_to_close=400, min_volume=10000,
         )
-        # Top N by volume
-        candidates.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
-        for m in candidates[: args.limit]:
+        # Filter out categories Polymarket US (CFTC-regulated DCM) doesn't
+        # list — primarily sports. Pick top by volume from what's left.
+        def _cat(m: dict) -> str:
+            return (m.get("category") or m.get("categorySlug") or "").lower()
+        non_sports = [m for m in candidates if _cat(m) not in US_UNLIKELY_CATEGORIES]
+        non_sports.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
+        n_skipped = len(candidates) - len(non_sports)
+        if n_skipped:
+            print(
+                f"  Filtered out {n_skipped} sports markets (Polymarket US "
+                f"doesn't list sports).\n"
+            )
+        for m in non_sports[: args.limit]:
             slug = m.get("slug")
             if slug:
                 intl_markets[slug] = m
