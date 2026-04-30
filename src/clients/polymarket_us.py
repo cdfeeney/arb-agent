@@ -184,6 +184,55 @@ class PolymarketUSClient:
             log.debug("Polymarket US auth book error for %s: %s", slug, e)
             return None
 
+    async def search(self, query: str, limit: int = 5) -> list[dict]:
+        """Full-text search across US events/markets. Returns event objects;
+        each event has a `markets` array with `slug` and `id`. This is how
+        we discover what slug US uses for a given question (US slugs differ
+        from international slugs even for the same event)."""
+        if not query:
+            return []
+        path = "/v1/search"
+        try:
+            async with self._semaphore:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(
+                        f"{self.PUBLIC_URL}{path}",
+                        params={"query": query, "limit": limit},
+                    )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("events") or []
+            log.debug(
+                "Polymarket US search failed for %r: %d %s",
+                query, resp.status_code, resp.text[:120],
+            )
+            return []
+        except Exception as e:
+            log.debug("Polymarket US search error for %r: %s", query, e)
+            return []
+
+    async def fetch_market_bbo(self, slug: str) -> Optional[dict]:
+        """Best-bid-offer + depth for one market. Lighter than /book.
+        Returns the marketData dict or None on error."""
+        if not slug:
+            return None
+        path = f"/v1/markets/{slug}/bbo"
+        try:
+            async with self._semaphore:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(f"{self.PUBLIC_URL}{path}")
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("marketData") or data
+            log.debug(
+                "Polymarket US bbo fetch failed for %s: %d %s",
+                slug, resp.status_code, resp.text[:120],
+            )
+            return None
+        except Exception as e:
+            log.debug("Polymarket US bbo error for %s: %s", slug, e)
+            return None
+
     @staticmethod
     def _parse_book(data: dict) -> dict:
         md = data.get("marketData") or data

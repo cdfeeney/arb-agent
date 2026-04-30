@@ -225,32 +225,75 @@ async def main() -> None:
                 intl_clob_yes_ask, _ = poly_intl.best_ask_from_book(yes_book)
                 intl_clob_yes_bid, _ = poly_intl.best_bid_from_book(yes_book)
 
-        # US side
-        us_book = await poly_us.fetch_market_book(slug)
-        us_yes_bid = us_yes_ask = None
-        if us_book:
-            us_yes_bid, _ = PolymarketUSClient.best_bid_from_book(us_book)
-            us_yes_ask, _ = PolymarketUSClient.best_ask_from_book(us_book)
+        question = (intl.get("question") or "")
+        question_short = question[:70]
 
-        question = (intl.get("question") or "")[:70]
+        # US side: use search to find the matching slug — US slugs differ
+        # from intl slugs even for the same event. Fall back to direct slug
+        # lookup if search returns nothing.
+        us_slug = None
+        us_match_question = None
+        if question:
+            events = await poly_us.search(question, limit=3)
+            for ev in events:
+                for m in (ev.get("markets") or []):
+                    cand_slug = m.get("slug") or ""
+                    cand_q = m.get("question") or ev.get("title") or ""
+                    if cand_slug:
+                        us_slug = cand_slug
+                        us_match_question = cand_q
+                        break
+                if us_slug:
+                    break
+
+        # If search didn't resolve, try the original intl slug verbatim.
+        if not us_slug:
+            us_slug = slug
+
+        # Prefer BBO endpoint (lighter than full book); fall back to book.
+        us_bbo = await poly_us.fetch_market_bbo(us_slug)
+        us_yes_bid = us_yes_ask = None
+        us_book = None
+        if us_bbo:
+            bb = us_bbo.get("bestBid") or {}
+            ba = us_bbo.get("bestAsk") or {}
+            try:
+                us_yes_bid = float(bb.get("value", 0) or 0)
+            except (TypeError, ValueError):
+                us_yes_bid = None
+            try:
+                us_yes_ask = float(ba.get("value", 0) or 0)
+            except (TypeError, ValueError):
+                us_yes_ask = None
+        else:
+            us_book = await poly_us.fetch_market_book(us_slug)
+            if us_book:
+                us_yes_bid, _ = PolymarketUSClient.best_bid_from_book(us_book)
+                us_yes_ask, _ = PolymarketUSClient.best_ask_from_book(us_book)
+
         print(f"  --- {slug} ---")
-        print(f"      Q: {question}")
+        print(f"      Q: {question_short}")
+        if us_match_question and us_match_question != question:
+            print(f"      US Q: {us_match_question[:70]}  (slug={us_slug})")
+        elif us_slug != slug:
+            print(f"      US slug: {us_slug}")
         print(f"      Intl (Gamma):     YES bid={intl_yes_bid:.4f}  ask={intl_yes_ask:.4f}")
         if intl_clob_yes_bid is not None:
             print(f"      Intl (CLOB live): YES bid={intl_clob_yes_bid:.4f}  ask={intl_clob_yes_ask:.4f}")
-        if us_book is not None:
+        if us_yes_bid is not None or us_yes_ask is not None:
             print(f"      US   (api.us):    YES bid={us_yes_bid or 0:.4f}  ask={us_yes_ask or 0:.4f}")
             if intl_clob_yes_ask is not None and us_yes_ask:
                 ask_diff = us_yes_ask - intl_clob_yes_ask
                 print(f"      Δ ASK (US - intl-CLOB): {ask_diff:+.4f}")
                 diffs.append({
                     "slug": slug,
+                    "us_slug": us_slug,
                     "ask_diff": ask_diff,
                     "intl_ask": intl_clob_yes_ask,
                     "us_ask": us_yes_ask,
                 })
         else:
-            print(f"      US   (api.us):    BOOK NOT AVAILABLE (404 or empty)")
+            print(f"      US   (api.us):    NO MATCH (search returned nothing, slug 404)")
         print()
 
     if diffs:
