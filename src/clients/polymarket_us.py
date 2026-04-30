@@ -86,39 +86,52 @@ class PolymarketUSClient:
         volume_num_min: int | None = None,
         end_date_max: str | None = None,
     ) -> list[dict]:
-        """List markets, paginated. Public endpoint — no auth required."""
-        markets: list[dict] = []
-        offset = 0
-        async with httpx.AsyncClient(timeout=30) as client:
-            while True:
-                params: dict[str, Any] = {
-                    "limit": limit,
-                    "offset": offset,
-                    "active": str(active).lower(),
-                    "closed": str(closed).lower(),
-                }
-                if volume_num_min is not None:
-                    params["volumeNumMin"] = volume_num_min
-                if end_date_max is not None:
-                    params["endDateMax"] = end_date_max
-                async with self._semaphore:
-                    resp = await client.get(
-                        f"{self.PUBLIC_URL}/v1/markets", params=params,
-                    )
-                if resp.status_code != 200:
-                    log.warning(
-                        "Polymarket US fetch_markets failed: %d %s",
-                        resp.status_code, resp.text[:200],
-                    )
-                    break
-                data = resp.json()
-                batch = data.get("markets") or []
-                if not batch:
-                    break
-                markets.extend(batch)
-                if len(batch) < limit:
-                    break
-                offset += limit
+        """List markets, paginated. Tries public gateway first, then signed
+        api host as fallback. The docs label /v1/markets as 'public' but
+        empirically gateway has returned empty results so we retry with auth."""
+        params_base: dict[str, Any] = {
+            "active": str(active).lower(),
+            "closed": str(closed).lower(),
+        }
+        if volume_num_min is not None:
+            params_base["volumeNumMin"] = volume_num_min
+        if end_date_max is not None:
+            params_base["endDateMax"] = end_date_max
+
+        async def _paginate(host: str, signed: bool) -> list[dict]:
+            out: list[dict] = []
+            offset = 0
+            path_base = "/v1/markets"
+            async with httpx.AsyncClient(timeout=30) as client:
+                while True:
+                    params = {**params_base, "limit": limit, "offset": offset}
+                    headers = self._auth_headers("GET", path_base) if signed else {}
+                    async with self._semaphore:
+                        resp = await client.get(
+                            f"{host}{path_base}", params=params, headers=headers,
+                        )
+                    if resp.status_code != 200:
+                        log.warning(
+                            "Polymarket US fetch_markets %s failed: %d %s",
+                            "(auth)" if signed else "(public)",
+                            resp.status_code, resp.text[:200],
+                        )
+                        break
+                    data = resp.json()
+                    batch = data.get("markets") or []
+                    if not batch:
+                        break
+                    out.extend(batch)
+                    if len(batch) < limit:
+                        break
+                    offset += limit
+            return out
+
+        # Public first
+        markets = await _paginate(self.PUBLIC_URL, signed=False)
+        if not markets and self.authenticated:
+            log.info("Polymarket US: public gateway empty, trying signed api host")
+            markets = await _paginate(self.AUTH_URL, signed=True)
         log.info("Polymarket US: fetched %d markets", len(markets))
         return markets
 
@@ -127,34 +140,62 @@ class PolymarketUSClient:
             {"bids": [{"px": str, "qty": str}, ...],
              "offers": [{"px": str, "qty": str}, ...]}
         bids descending by price, offers ascending. None on error.
+
+        Tries the public gateway first; falls back to the authenticated
+        host with signed headers if creds are loaded. The docs are
+        ambiguous about whether book queries are public or auth-only —
+        try both rather than guess.
         """
         if not slug:
+            return None
+        path = f"/v1/markets/{slug}/book"
+        # Public attempt
+        try:
+            async with self._semaphore:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(f"{self.PUBLIC_URL}{path}")
+            if resp.status_code == 200:
+                return self._parse_book(resp.json())
+            log.debug(
+                "Polymarket US public book fetch failed for %s: %d %s",
+                slug, resp.status_code, resp.text[:120],
+            )
+        except Exception as e:
+            log.debug("Polymarket US public book error for %s: %s", slug, e)
+
+        # Authenticated fallback
+        if not self.authenticated:
             return None
         try:
             async with self._semaphore:
                 async with httpx.AsyncClient(timeout=15) as client:
                     resp = await client.get(
-                        f"{self.PUBLIC_URL}/v1/markets/{slug}/book",
+                        f"{self.AUTH_URL}{path}",
+                        headers=self._auth_headers("GET", path),
                     )
-            if resp.status_code != 200:
-                log.debug(
-                    "Polymarket US book fetch failed for %s: %d", slug, resp.status_code,
-                )
-                return None
-            data = resp.json()
-            md = data.get("marketData") or data
-            bids = sorted(
-                md.get("bids") or [],
-                key=lambda x: -float(x.get("px", 0)),
+            if resp.status_code == 200:
+                return self._parse_book(resp.json())
+            log.debug(
+                "Polymarket US auth book fetch failed for %s: %d %s",
+                slug, resp.status_code, resp.text[:120],
             )
-            offers = sorted(
-                md.get("offers") or [],
-                key=lambda x: float(x.get("px", 1)),
-            )
-            return {"bids": bids, "offers": offers}
-        except Exception as e:
-            log.debug("Polymarket US book fetch error for %s: %s", slug, e)
             return None
+        except Exception as e:
+            log.debug("Polymarket US auth book error for %s: %s", slug, e)
+            return None
+
+    @staticmethod
+    def _parse_book(data: dict) -> dict:
+        md = data.get("marketData") or data
+        bids = sorted(
+            md.get("bids") or [],
+            key=lambda x: -float(x.get("px", 0)),
+        )
+        offers = sorted(
+            md.get("offers") or [],
+            key=lambda x: float(x.get("px", 1)),
+        )
+        return {"bids": bids, "offers": offers}
 
     async def whoami(self) -> Optional[dict]:
         """Authenticated identity check. Used to validate credentials are loaded

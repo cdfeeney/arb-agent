@@ -89,7 +89,26 @@ async def main() -> None:
     poly_intl = PolymarketClient(rate_limit_per_min=120)
     poly_us = PolymarketUSClient(rate_limit_per_min=120)
 
-    print(f"\n=== Polymarket US vs International Price Diff ===\n")
+    # Sanity probe: dump what US actually has so we can see the slug format
+    # they use vs international. If 404s persist on slugs we know exist on
+    # intl, the slugs almost certainly differ between the two platforms.
+    print("\n=== US side market sample (top 10 by volume) ===\n")
+    us_sample = await poly_us.fetch_markets(limit=50, active=True, closed=False)
+    us_sample.sort(
+        key=lambda m: float(m.get("volumeNum", 0) or m.get("volume", 0) or 0),
+        reverse=True,
+    )
+    if not us_sample:
+        print("  (US returned NO markets at all — endpoint or auth issue)")
+    else:
+        print(f"  Found {len(us_sample)} active markets on US gateway. Top 10:")
+        for m in us_sample[:10]:
+            slug = m.get("slug") or "(no-slug)"
+            q = (m.get("question") or "")[:65]
+            print(f"    {slug:55s}  {q}")
+    print()
+
+    print(f"=== Polymarket US vs International Price Diff ===\n")
     print(
         f"US client authenticated: {poly_us.authenticated}  "
         f"(read-only diff still works without creds)"
