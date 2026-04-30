@@ -38,12 +38,38 @@ from src.config import load_config  # noqa: E402
 
 
 # Polymarket US is CFTC-regulated; doesn't list state-regulated sports books.
-# Filter to categories we expect to exist on both sides.
-US_LIKELY_CATEGORIES = {
-    "politics", "elections", "economics", "finance", "crypto",
-    "tech", "geopolitics", "world", "mentions", "culture", "weather",
-}
-US_UNLIKELY_CATEGORIES = {"sports"}
+# Gamma's `category` field on individual markets is often empty/inconsistent,
+# so rely on question-text matching for sports keywords as the primary filter.
+SPORTS_KEYWORDS = (
+    "fifa", "world cup", "nba", "nba finals", "stanley cup", "nhl", "nfl",
+    "super bowl", "mlb", "world series", "ufc", "boxing", "tennis", "f1",
+    "formula 1", "premier league", "champions league", "uefa", "olympics",
+    "ncaa", "march madness", "wimbledon", "us open", "masters",
+    "heavyweight", "middleweight", "bantamweight", "flyweight",
+    "drivers' champion", "constructors' champion",
+    "wins the", "win the 20",  # "wins the 2026 X" / "win the 2026 Y" pattern
+)
+
+
+def _is_sports(market: dict) -> bool:
+    """Best-effort sports detection via category OR question text."""
+    cat = (market.get("category") or market.get("categorySlug") or "").lower()
+    if cat == "sports":
+        return True
+    q = (market.get("question") or "").lower()
+    return any(kw in q for kw in SPORTS_KEYWORDS)
+
+
+# Fallback slugs known to exist on Polymarket US (politics / IPO / crypto /
+# economics) — used if the Gamma top-by-volume path returns mostly sports
+# even after filtering. User can override with --slugs.
+FALLBACK_SLUGS = [
+    "will-openai-not-ipo-by-december-31-2026",
+    "will-bitcoin-reach-200000-by-december-31-2026",
+    "will-the-republican-party-control-the-house-after-the-2026-midterm-elections",
+    "another-us-debt-downgrade-before-2027",
+    "will-no-fed-rate-cuts-happen-in-2026",
+]
 
 
 async def main() -> None:
@@ -88,27 +114,27 @@ async def main() -> None:
 
     if args.slugs:
         slugs = [s.strip() for s in args.slugs.split(",") if s.strip()]
-        # No quick reverse lookup from slug → market on Gamma; fetch by-slug
-        # via filter param.
-        for s in slugs:
-            ms = await poly_intl.fetch_markets(
-                limit=1, max_markets=1,
-                max_days_to_close=400, min_volume=0,
-            )
-            for m in ms:
-                if m.get("slug") == s:
-                    intl_markets[s] = m
-                    break
+        # Direct slug lookup via Gamma's slug filter param.
+        import httpx
+        async with httpx.AsyncClient(timeout=30) as client:
+            for s in slugs:
+                try:
+                    resp = await client.get(
+                        "https://gamma-api.polymarket.com/markets",
+                        params={"slug": s, "limit": 1},
+                    )
+                    if resp.status_code == 200:
+                        batch = resp.json() or []
+                        if batch:
+                            intl_markets[s] = batch[0]
+                except Exception:
+                    pass
     else:
         candidates = await poly_intl.fetch_markets(
-            limit=200, max_markets=200,
+            limit=300, max_markets=300,
             max_days_to_close=400, min_volume=10000,
         )
-        # Filter out categories Polymarket US (CFTC-regulated DCM) doesn't
-        # list — primarily sports. Pick top by volume from what's left.
-        def _cat(m: dict) -> str:
-            return (m.get("category") or m.get("categorySlug") or "").lower()
-        non_sports = [m for m in candidates if _cat(m) not in US_UNLIKELY_CATEGORIES]
+        non_sports = [m for m in candidates if not _is_sports(m)]
         non_sports.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
         n_skipped = len(candidates) - len(non_sports)
         if n_skipped:
@@ -120,6 +146,33 @@ async def main() -> None:
             slug = m.get("slug")
             if slug:
                 intl_markets[slug] = m
+
+        # If filtering still left us with mostly sports (e.g. Gamma is
+        # 100% sports right now), fall back to known politics/IPO/crypto
+        # slugs that should exist on US.
+        if len(intl_markets) < args.limit:
+            print(
+                f"  Only {len(intl_markets)} non-sports markets matched; "
+                f"using fallback slug list.\n"
+            )
+            import httpx
+            async with httpx.AsyncClient(timeout=30) as client:
+                for s in FALLBACK_SLUGS:
+                    if s in intl_markets:
+                        continue
+                    if len(intl_markets) >= args.limit:
+                        break
+                    try:
+                        resp = await client.get(
+                            "https://gamma-api.polymarket.com/markets",
+                            params={"slug": s, "limit": 1},
+                        )
+                        if resp.status_code == 200:
+                            batch = resp.json() or []
+                            if batch:
+                                intl_markets[s] = batch[0]
+                    except Exception:
+                        pass
         slugs = list(intl_markets.keys())
 
     if not slugs:
