@@ -128,6 +128,7 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
             "platform": "polymarket",
             "ticker": str(raw.get("id", "")),
             "question": raw.get("question", ""),
+            "category": raw.get("category", "") or raw.get("categorySlug", "") or "",
             "yes_price": round(yes_price, 4),
             "no_price": round(no_price, 4),
             "volume": float(raw.get("volume", 0)),

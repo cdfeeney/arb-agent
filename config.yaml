@@ -67,13 +67,27 @@ filters:
                                # bets). The 60-day window was systematically excluding the
                                # bulk of the opportunity set. Watch for re-introduction of
                                # the "unquoted long-dated markets" bug — if seen, narrow back.
-  min_profit_pct: 0.02         # 2% minimum net edge after fees
+  min_profit_pct: 0.03         # 3% minimum gross edge. With Kalshi taker (0.07) + Polymarket
+                               # politics taker (0.04), entry-only fees ≈ 2.75% of stake at
+                               # P≈0.5. Holding to resolution: break-even ~2.75%. Anything
+                               # under 3% gross is negative-EV by design even before slippage
+                               # or partial-unwind exit fees. Bump to 0.04 if we ever stop
+                               # holding to resolution (entry+exit fees ≈ 5.5%).
 
 sizing:
-  bankroll: 10000              # total capital deployed across both platforms
-  max_position_pct: 0.05       # never risk more than 5% of bankroll per opp
-  min_bet: 10                  # platform minimums
-  max_bet: 500
+  bankroll: 100                # total capital deployed across both platforms.
+                               # Paper-trading with $100 to mirror the real-life constraint
+                               # — sizing engine will reject opps that don't fit, and at
+                               # this bankroll we naturally favor higher-edge arbs.
+  max_position_pct: 0.10       # up to 10% of bankroll per opp = $10 max stake at $100 bankroll.
+                               # Bumped from 5% so we can actually deploy capital — at 5%
+                               # ($5 stake) Kalshi+Polymarket fees (~0.28) eat 5.6% of stake
+                               # which kills sub-5% arbs. $10 stakes get fees down to ~2.75%.
+  min_bet: 5                   # platform-side floor. Polymarket has no min; Kalshi ~$1
+                               # minimum order. We use $5 so a single leg at p≈0.5 is ≥$2.50
+                               # which clears Kalshi's per-trade minimum even on cheap legs.
+  max_bet: 10                  # hard ceiling at 10% of $100 bankroll. Single arb can't
+                               # blow through more than this.
   kelly_fraction: 0.25         # quarter-Kelly (conservative; tune up as you gain confidence)
   liquidity_cap_pct: 0.10      # don't take more than 10% of available market volume
   book_depth_fraction: 0.25    # entry leg-USD ≤ this fraction of unwind-side bid depth.
@@ -83,8 +97,18 @@ sizing:
                                # fine" principle: small in shallow books, larger in deep.
 
 fees:
-  kalshi_fee_rate: 0.07              # Kalshi: ceil(rate × N × p × (1-p)) cents per contract
-  polymarket_gas_per_order: 0.10     # Polymarket: flat USD gas per order on Polygon
+  # Both platforms charge ONLY the taker (the side hitting a resting order).
+  # Our arbs always cross the spread to fill instantly so we are always takers
+  # on entry; partial unwinds at the bid are also taker fills.
+  kalshi_fee_rate: 0.07              # Kalshi standard taker rate. Some categorised
+                                     # contracts are lower; this is the conservative default.
+  polymarket_default_rate: 0.05      # Generic / Other / Culture / Weather / Economics rate.
+                                     # Politics / Finance / Tech / Mentions: 0.04. Crypto: 0.072.
+                                     # Sports: 0.03. Geopolitics: free. Per-category lookup
+                                     # in fees.py picks the right rate when the market dict
+                                     # carries a `category` field.
+  # NOTE: no polymarket_gas_per_order. Polymarket relayer pays gas for traders
+  # — gas cost to us = $0.
 
 alerts:
   dedup_window_minutes: 60     # suppress re-alerts for same pair within this window

@@ -23,6 +23,7 @@ from typing import Optional
 from src.clients.kalshi import KalshiClient
 from src.clients.polymarket import PolymarketClient
 from src.db.store import Database
+from src.engine.fees import compute_unwind_fees
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +83,11 @@ class TradeMark:
     annualized_to_close_pct: float
     recommendation: str
     reason: str
+    # Buy-side leg dicts kept for fee calculation at unwind time. Carry the
+    # platform + question + category from the original entry so the fee
+    # engine can pick the right rate without re-fetching market metadata.
+    buy_yes: dict = None
+    buy_no: dict = None
     partial_unwind_size: float = 0.0
     partial_unwind_realized: float = 0.0
 
@@ -127,7 +133,7 @@ async def _bid_mark_polymarket(
 
 
 def _decide(
-    mark: TradeMark, cfg: ExitConfig,
+    mark: TradeMark, cfg: ExitConfig, fee_cfg: dict | None = None,
 ) -> tuple[str, str, float]:
     """Pure-function exit decision returning (recommendation, reason, unwind_size).
 
@@ -167,13 +173,16 @@ def _decide(
 
     # Profitability test: can we sell ONE contract on each leg at top-of-book
     # for more than we paid per pair? If yes_bid + no_bid > cost_per_contract,
-    # every unwound contract realizes (yes_bid + no_bid - cost_per_contract).
+    # every unwound contract realizes (yes_bid + no_bid - cost_per_contract)
+    # GROSS — but exit fees are real and we'd be paying them on top of the
+    # entry fees already burned. A partial unwind that doesn't clear its own
+    # exit fees is straight-up worse than just holding to resolution.
     sum_bids = yes_bid + no_bid
-    profit_per_contract = sum_bids - mark.cost_per_contract
-    if profit_per_contract <= 0:
+    gross_profit_per_contract = sum_bids - mark.cost_per_contract
+    if gross_profit_per_contract <= 0:
         return (
             "HOLD",
-            f"top bids {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} ≤ cost "
+            f"top bids {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} <= cost "
             f"{mark.cost_per_contract:.4f}",
             0.0,
         )
@@ -195,11 +204,31 @@ def _decide(
             raw_size,
         )
 
+    # Fee gate: exit fees on selling `raw_size` contracts on both legs at the
+    # current bids. If we don't clear those fees, holding to resolution is
+    # strictly better — we already paid entry fees, exit fees on a barely-
+    # profitable unwind just compound the drag.
+    exit_fees = 0.0
+    if fee_cfg is not None and mark.buy_yes is not None and mark.buy_no is not None:
+        exit_fees = compute_unwind_fees(
+            mark.buy_yes, mark.buy_no, yes_bid, no_bid, raw_size, fee_cfg,
+        )
+    gross_realized = gross_profit_per_contract * raw_size
+    net_realized = gross_realized - exit_fees
+    if net_realized <= 0:
+        return (
+            "WATCH",
+            f"top-of-book {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} clears "
+            f"cost but exit fees ${exit_fees:.2f} on {raw_size:.1f} contracts "
+            f"swallow the gross ${gross_realized:.2f}",
+            raw_size,
+        )
+
     return (
         "PARTIAL_UNWIND",
         f"top-of-book {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} > "
         f"cost {mark.cost_per_contract:.4f}, sell {raw_size:.2f} contracts "
-        f"@ ${profit_per_contract*raw_size:.2f}",
+        f"net ${net_realized:.2f} (gross ${gross_realized:.2f} - fees ${exit_fees:.2f})",
         raw_size,
     )
 
@@ -210,6 +239,7 @@ async def monitor_open_positions(
     poly: PolymarketClient,
     cfg: ExitConfig,
     dry_run: bool = True,
+    fee_cfg: dict | None = None,
 ) -> dict:
     """Mark-to-market every open paper trade. Returns summary for logging."""
     summary = {
@@ -236,17 +266,28 @@ async def monitor_open_positions(
             if mark is None:
                 summary["skipped"] += 1
                 continue
-            recommendation, reason, unwind_size = _decide(mark, cfg)
+            recommendation, reason, unwind_size = _decide(mark, cfg, fee_cfg)
             mark.recommendation = recommendation
             mark.reason = reason
 
             partial_realized = 0.0
             if recommendation == "PARTIAL_UNWIND" and unwind_size > 0:
-                profit_per_contract = (
+                gross_per_contract = (
                     mark.yes_leg.best_bid + mark.no_leg.best_bid
                     - mark.cost_per_contract
                 )
-                partial_realized = round(profit_per_contract * unwind_size, 4)
+                gross_realized = gross_per_contract * unwind_size
+                exit_fees = (
+                    compute_unwind_fees(
+                        mark.buy_yes, mark.buy_no,
+                        mark.yes_leg.best_bid, mark.no_leg.best_bid,
+                        unwind_size, fee_cfg or {},
+                    ) if fee_cfg is not None else 0.0
+                )
+                # Realized = NET of exit fees so partial_realized_usd accumulates
+                # the post-fee dollars actually banked. Entry fees are subtracted
+                # once at full close (apply_partial_unwind).
+                partial_realized = round(gross_realized - exit_fees, 4)
                 mark.partial_unwind_size = unwind_size
                 mark.partial_unwind_realized = partial_realized
 
@@ -429,6 +470,21 @@ async def _build_mark(
     else:
         annualized_to_close_pct = 0.0
 
+    # Reconstruct fee-relevant leg dicts from the stored paper_trade row so
+    # the unwind-fee calculator can pick the right per-platform / category
+    # rate without re-fetching market metadata. category is best-effort —
+    # legacy rows may be NULL, in which case fees.py falls back to default.
+    buy_yes_skel = {
+        "platform": yes_platform,
+        "category": trade.get("yes_category", ""),
+        "yes_price": yes_paid,
+    }
+    buy_no_skel = {
+        "platform": no_platform,
+        "category": trade.get("no_category", ""),
+        "no_price": no_paid,
+    }
+
     return TradeMark(
         paper_trade_id=int(trade["id"]),
         yes_leg=yes_mark,
@@ -448,4 +504,6 @@ async def _build_mark(
         annualized_to_close_pct=annualized_to_close_pct,
         recommendation="HOLD",
         reason="",
+        buy_yes=buy_yes_skel,
+        buy_no=buy_no_skel,
     )

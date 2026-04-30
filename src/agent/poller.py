@@ -194,6 +194,7 @@ class PollingAgent:
             mon = await position_monitor.monitor_open_positions(
                 self.db, self.kalshi, self.poly, self.exit_cfg,
                 dry_run=self.cfg.get("dry_run", True),
+                fee_cfg=self.cfg.get("fees", {}),
             )
             if mon["n_open"] > 0:
                 log.info(

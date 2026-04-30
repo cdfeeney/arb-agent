@@ -559,16 +559,20 @@ class Database:
     ) -> dict:
         """Decrement contracts_remaining + accumulate partial realized profit.
 
-        Returns the post-update {contracts_remaining, partial_realized_usd,
-        fully_closed} so the caller can decide whether to close the trade.
+        `realized_usd` should already be NET of exit fees on this partial.
+        We accumulate into `partial_realized_usd`. When the trade fully
+        closes (remaining = 0) we subtract the entry fees that were paid
+        once at the start so `realized_profit_usd` reflects the true
+        end-to-end net dollars: sum(net partial unwinds) - entry_fees.
 
         Atomic in a single transaction so concurrent monitor cycles can't
-        race-condition the same trade into negative remainders.
+        race the same trade into negative remainders.
         """
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT contracts_remaining, partial_realized_usd "
+                "SELECT contracts_remaining, partial_realized_usd, "
+                "       fees_estimated_usd "
                 "FROM paper_trades WHERE id=? AND status='open'",
                 (trade_id,),
             )
@@ -578,10 +582,12 @@ class Database:
                         "fully_closed": True}
             cur_remaining = float(row["contracts_remaining"] or 0)
             cur_realized = float(row["partial_realized_usd"] or 0)
+            entry_fees = float(row["fees_estimated_usd"] or 0)
             new_remaining = max(0.0, cur_remaining - unwind_size)
             new_realized = round(cur_realized + realized_usd, 4)
             fully_closed = new_remaining <= 0.0001  # float tolerance
             if fully_closed:
+                final_realized = round(new_realized - entry_fees, 4)
                 await db.execute(
                     """UPDATE paper_trades SET
                            contracts_remaining=0,
@@ -590,7 +596,7 @@ class Database:
                            status='closed',
                            resolved_at=?
                        WHERE id=?""",
-                    (new_realized, new_realized,
+                    (new_realized, final_realized,
                      datetime.now(timezone.utc).isoformat(), trade_id),
                 )
             else:
