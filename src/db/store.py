@@ -57,6 +57,9 @@ class Database:
                     no_size_usd         REAL,
                     no_contracts        REAL,
 
+                    yes_token           TEXT,
+                    no_token            TEXT,
+
                     edge_gross_pct      REAL,
                     implied_sum         REAL,
                     fees_estimated_usd  REAL,
@@ -179,8 +182,25 @@ class Database:
                     reason     TEXT
                 )
             """)
+
+            # Migration: older paper_trades rows were saved before we captured
+            # the Polymarket clob token ids. Position monitor needs them to
+            # fetch live bid books for the unwind-value calculation. Add the
+            # columns if they're missing — old rows get NULL (monitor falls
+            # back to "no book available" for them, same behavior as before).
+            await self._maybe_add_column(db, "paper_trades", "yes_token", "TEXT")
+            await self._maybe_add_column(db, "paper_trades", "no_token", "TEXT")
             await db.commit()
         log.info(f"Database ready: {self.path}")
+
+    @staticmethod
+    async def _maybe_add_column(db, table: str, col: str, sql_type: str) -> None:
+        """Idempotently add a column to a table (PRAGMA-checks first)."""
+        cur = await db.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in await cur.fetchall()}
+        if col not in existing:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}")
+            log.info("Schema migration: added %s.%s (%s)", table, col, sql_type)
 
     async def get_verification(self, pair_id: str, ttl_hours: int) -> dict | None:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat()
@@ -238,6 +258,13 @@ class Database:
             (yes.get("closes_at") or no.get("closes_at")) or datetime.now(timezone.utc),
             (no.get("closes_at") or yes.get("closes_at")) or datetime.now(timezone.utc),
         )
+        # Polymarket markets carry token ids on the normalized dict; Kalshi
+        # markets don't (uses the ticker for lookups). Record whichever side
+        # is on Polymarket so the position monitor can fetch the live bid
+        # book to value our unwind. None for Kalshi legs.
+        yes_token = yes.get("yes_token") if yes.get("platform") == "polymarket" else None
+        no_token  = no.get("no_token")   if no.get("platform")  == "polymarket" else None
+
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
                 """INSERT INTO paper_trades (
@@ -246,15 +273,17 @@ class Database:
                     yes_observed_price, yes_size_usd, yes_contracts,
                     no_platform, no_ticker, no_question, no_url,
                     no_observed_price, no_size_usd, no_contracts,
+                    yes_token, no_token,
                     edge_gross_pct, implied_sum, fees_estimated_usd,
                     predicted_net_usd, predicted_net_pct, status
-                ) VALUES (?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?, ?,?,?, ?,?, 'open')""",
+                ) VALUES (?,?, ?,?,?,?, ?,?,?, ?,?,?,?, ?,?,?, ?,?, ?,?,?, ?,?, 'open')""",
                 (
                     opp["pair_id"], closes_at.isoformat() if closes_at else None,
                     yes["platform"], yes["ticker"], yes["question"], yes["url"],
                     yes["yes_price"], sizing["leg_yes"]["usd"], sizing["leg_yes"]["contracts"],
                     no["platform"], no["ticker"], no["question"], no["url"],
                     no["no_price"], sizing["leg_no"]["usd"], sizing["leg_no"]["contracts"],
+                    yes_token, no_token,
                     opp["profit_pct"], opp["implied_sum"], fees.get("worst_case_total", 0),
                     sizing["net_profit"], sizing["net_profit_pct"],
                 ),

@@ -289,22 +289,24 @@ async def _build_mark(
     if yes_contracts <= 0 or no_contracts <= 0:
         return None
 
+    yes_token = trade.get("yes_token")
+    no_token = trade.get("no_token")
+
     # Fetch bid books for whichever side each leg lives on.
     if yes_platform == "kalshi":
         yes_mark = await _bid_mark_kalshi(kalshi, yes_ticker, "yes", yes_contracts)
-    elif yes_platform == "polymarket":
-        # We don't store the YES token id on paper_trades today, but the
-        # opportunity scanner has it on the market dict. For v1 paper-only
-        # operation we approximate using best-bid via Gamma; CLOB token
-        # round-trip gets added in v2 when we wire to live order placement.
-        yes_mark = LegMark(0.0, 0.0, 0.0, yes_contracts, False)
+    elif yes_platform == "polymarket" and yes_token:
+        yes_mark = await _bid_mark_polymarket(poly, yes_token, yes_contracts)
     else:
+        # Polymarket leg without a stored token (older row from before the
+        # token-capture migration) — can't price the unwind, fall through
+        # as "book unavailable" so monitor refuses to recommend exit.
         yes_mark = LegMark(0.0, 0.0, 0.0, yes_contracts, False)
 
     if no_platform == "kalshi":
         no_mark = await _bid_mark_kalshi(kalshi, no_ticker, "no", no_contracts)
-    elif no_platform == "polymarket":
-        no_mark = LegMark(0.0, 0.0, 0.0, no_contracts, False)
+    elif no_platform == "polymarket" and no_token:
+        no_mark = await _bid_mark_polymarket(poly, no_token, no_contracts)
     else:
         no_mark = LegMark(0.0, 0.0, 0.0, no_contracts, False)
 
