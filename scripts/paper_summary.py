@@ -47,21 +47,34 @@ async def main():
         rows = list(await cur.fetchall())
 
         print(f"\n=== Paper Trade Summary{' (last %sh)' % args.recent if args.recent else ''} ===\n")
-        print(f"{'Status':<10} {'Count':>6} {'Avg Edge':>9} {'Predicted P&L':>15} {'Realized P&L':>15}")
-        print("-" * 60)
+        print(f"{'Status':<14} {'Count':>6} {'Avg Edge':>9} {'Predicted P&L':>15} {'Realized P&L':>15}")
+        print("-" * 64)
         total_n = 0
         total_pred = 0.0
         total_real = 0.0
+        legacy_n = 0
+        legacy_pred = 0.0
         for r in rows:
             n = r["n"]; pred = r["pred"] or 0; real = r["real"]
             avg = r["avg_edge"] or 0
             real_str = f"${real:.2f}" if real is not None else "(unresolved)"
-            print(f"{r['status']:<10} {n:>6} {avg*100:>8.2f}% ${pred:>13.2f} {real_str:>15}")
+            print(f"{r['status']:<14} {n:>6} {avg*100:>8.2f}% ${pred:>13.2f} {real_str:>15}")
+            if r["status"] == "legacy_broken":
+                legacy_n += n
+                legacy_pred += pred
+                continue
             total_n += n
             total_pred += pred
             if real is not None: total_real += real
-        print("-" * 60)
-        print(f"{'TOTAL':<10} {total_n:>6} {'':>9} ${total_pred:>13.2f} ${total_real:>13.2f}\n")
+        print("-" * 64)
+        print(f"{'TOTAL (live)':<14} {total_n:>6} {'':>9} ${total_pred:>13.2f} ${total_real:>13.2f}")
+        if legacy_n:
+            print(
+                f"  + {legacy_n} legacy_broken trades (${legacy_pred:.2f} pred) "
+                f"excluded — closed by stale code without realized P&L; "
+                f"see triggers in store.py."
+            )
+        print()
 
         # Recently-closed unresolved (resolution lagging)
         cur = await db.execute(
