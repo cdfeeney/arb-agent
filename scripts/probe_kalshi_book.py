@@ -43,19 +43,24 @@ async def probe(kalshi: KalshiClient, ticker: str, our_recorded_bid: float | Non
         return
     raw = resp.json()
     print(f"    response keys: {sorted(raw.keys())}")
-    ob = raw.get("orderbook", {})
-    print(f"    orderbook keys: {sorted(ob.keys()) if isinstance(ob, dict) else type(ob).__name__}")
-    if isinstance(ob, dict):
-        for k in sorted(ob.keys()):
-            v = ob[k]
-            if isinstance(v, list):
-                print(f"      orderbook[{k!r}]: {len(v)} entries", end="")
-                if v:
-                    print(f"  sample first: {v[0]}")
+    # Kalshi appears to have renamed `orderbook` → `orderbook_fp` (same
+    # pattern as `volume` → `volume_fp` on the markets endpoint). Probe both.
+    for ob_key in ("orderbook", "orderbook_fp"):
+        ob = raw.get(ob_key)
+        if ob is None:
+            continue
+        print(f"    {ob_key} keys: {sorted(ob.keys()) if isinstance(ob, dict) else type(ob).__name__}")
+        if isinstance(ob, dict):
+            for k in sorted(ob.keys()):
+                v = ob[k]
+                if isinstance(v, list):
+                    print(f"      {ob_key}[{k!r}]: {len(v)} entries", end="")
+                    if v:
+                        print(f"  sample first: {v[0]}")
+                    else:
+                        print()
                 else:
-                    print()
-            else:
-                print(f"      orderbook[{k!r}]: {v!r}")
+                    print(f"      {ob_key}[{k!r}]: {v!r}")
 
     # Now run through our parser
     book = await kalshi.fetch_orderbook(ticker)
