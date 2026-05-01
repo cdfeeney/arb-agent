@@ -62,9 +62,13 @@ async def main():
     cfg = load_config("config.yaml")
     db_path = cfg["database"]["path"]
 
-    api_key_id = os.environ.get(cfg["kalshi"]["api_key_env"], "")
-    private_key_path = cfg["kalshi"]["private_key_path"]
-    kalshi = KalshiClient(api_key_id=api_key_id, private_key_path=private_key_path)
+    # config.py overlays env-var values into cfg["kalshi"]["api_key_id"] /
+    # cfg["kalshi"]["private_key_path"] when KALSHI_API_KEY_ID and
+    # KALSHI_PRIVATE_KEY_PATH are set. Read directly from cfg.
+    kalshi = KalshiClient(
+        api_key_id=cfg["kalshi"]["api_key_id"],
+        private_key_path=cfg["kalshi"]["private_key_path"],
+    )
 
     where = "WHERE pt.status='open'"
     params: list = []
