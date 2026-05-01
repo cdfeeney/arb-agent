@@ -101,7 +101,10 @@ class PollingAgent:
             poly_raw = []
 
         if kalshi_raw and not getattr(self, "_debug_dumped", False):
-            with_prices = [m for m in kalshi_raw if m.get("yes_bid") or m.get("yes_ask") or m.get("last_price")]
+            with_prices = [
+                m for m in kalshi_raw
+                if m.get("yes_bid_dollars") or m.get("yes_ask_dollars") or m.get("last_price_dollars")
+            ]
             log.info(
                 "DEBUG Kalshi: %d/%d markets have any price field. First market keys: %s",
                 len(with_prices), len(kalshi_raw), sorted(kalshi_raw[0].keys()),
@@ -111,8 +114,8 @@ class PollingAgent:
                 log.info(
                     "DEBUG first PRICED Kalshi market — ticker=%s title=%s yes_bid=%s yes_ask=%s last=%s vol=%s status=%s",
                     m.get("ticker"), (m.get("title") or "")[:60],
-                    m.get("yes_bid"), m.get("yes_ask"), m.get("last_price"),
-                    m.get("volume"), m.get("status"),
+                    m.get("yes_bid_dollars"), m.get("yes_ask_dollars"), m.get("last_price_dollars"),
+                    m.get("volume_fp"), m.get("status"),
                 )
             else:
                 log.info("DEBUG no priced markets — first raw market dump: %s", kalshi_raw[0])
