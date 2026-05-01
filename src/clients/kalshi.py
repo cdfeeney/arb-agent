@@ -161,15 +161,21 @@ class KalshiClient:
                     resp = await client.get(url, headers=self._auth_headers("GET", path))
             if resp.status_code != 200:
                 return None
-            data = resp.json().get("orderbook", {})
-            # Kalshi returns yes/no as list of [price_cents, size] pairs.
-            # Bids are buyers (descending in price); asks are sellers (ascending).
-            # Older response shapes used different keys — be defensive.
+            payload = resp.json()
+            # Kalshi changed the orderbook envelope ~2026: response now wraps
+            # in `orderbook_fp` with `yes_dollars`/`no_dollars` arrays of
+            # [price_string_in_dollars, size_string] pairs. Old format used
+            # `orderbook` with `yes`/`no`. Read whichever the API returned.
+            ob = payload.get("orderbook_fp") or payload.get("orderbook") or {}
+            yes_raw = ob.get("yes_dollars") or ob.get("yes") or []
+            no_raw  = ob.get("no_dollars")  or ob.get("no")  or []
+            yes_asks_raw = ob.get("yes_asks_dollars") or ob.get("yes_asks") or []
+            no_asks_raw  = ob.get("no_asks_dollars")  or ob.get("no_asks")  or []
             return {
-                "yes_bids": _sort_book(data.get("yes", []), descending=True),
-                "yes_asks": _sort_book(data.get("yes_asks", []) or data.get("yes", []), descending=False),
-                "no_bids":  _sort_book(data.get("no", []), descending=True),
-                "no_asks":  _sort_book(data.get("no_asks", []) or data.get("no", []), descending=False),
+                "yes_bids": _sort_book(yes_raw, descending=True),
+                "yes_asks": _sort_book(yes_asks_raw or yes_raw, descending=False),
+                "no_bids":  _sort_book(no_raw,  descending=True),
+                "no_asks":  _sort_book(no_asks_raw or no_raw,  descending=False),
             }
         except Exception as e:
             log.debug("Kalshi orderbook fetch failed for %s: %s", ticker, e)
