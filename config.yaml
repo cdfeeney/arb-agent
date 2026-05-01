@@ -83,12 +83,16 @@ sizing:
                                # Bumped from 5% so we can actually deploy capital — at 5%
                                # ($5 stake) Kalshi+Polymarket fees (~0.28) eat 5.6% of stake
                                # which kills sub-5% arbs. $10 stakes get fees down to ~2.75%.
-  min_bet: 5                   # platform-side floor. Polymarket has no min; Kalshi ~$1
-                               # minimum order. We use $5 so a single leg at p≈0.5 is ≥$2.50
-                               # which clears Kalshi's per-trade minimum even on cheap legs.
+  min_bet: 1                   # platform-side floor. Polymarket has no min; Kalshi ~$1
+                               # minimum order. We use $1 so Kelly-computed stakes (typically
+                               # $1–$11 on $100 bankroll at full Kelly) aren't reject-and-skipped.
   max_bet: 10                  # hard ceiling at 10% of $100 bankroll. Single arb can't
                                # blow through more than this.
-  kelly_fraction: 0.25         # quarter-Kelly (conservative; tune up as you gain confidence)
+  kelly_fraction: 1.0          # full Kelly. Rationale: cross-platform arbs are near-deterministic
+                               # (both sides hedge each other); the variance that justifies
+                               # quarter-Kelly comes from leg-fill risk, which our naked-leg
+                               # defense (#34) will handle separately. Until then max_bet caps
+                               # exposure at 10% of bankroll regardless of what Kelly says.
   liquidity_cap_pct: 0.10      # don't take more than 10% of available market volume
   book_depth_fraction: 0.25    # entry leg-USD ≤ this fraction of unwind-side bid depth.
                                # Stops phantom MTM losses by ensuring positions can be
