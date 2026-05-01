@@ -1,8 +1,13 @@
 dry_run: true   # true = find + alert opportunities but place NO real orders
 
 polling:
-  interval_seconds: 30
+  interval_seconds: 30                # main entry-side scan cadence (5000+10000 markets)
   max_concurrent_fetches: 10
+  monitor_interval_seconds: 15        # exit-side hot loop. Polls only the bid books for
+                                      # currently-open positions. Decoupled from the entry
+                                      # scan so we can react to book moves at sub-minute
+                                      # cadence without waiting for the slow market-wide poll.
+  monitor_max_concurrent: 8           # books fetched in parallel per monitor cycle
 
 kalshi:
   base_url: "https://trading-api.kalshi.com/trade-api/v2"

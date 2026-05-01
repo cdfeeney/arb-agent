@@ -210,29 +210,53 @@ class PollingAgent:
                 log.info("[DRY RUN] Would place orders — skipping execution")
             alerted += 1
 
-        # Mark-to-market every still-open paper trade. Runs even on cycles
-        # where we found 0 new arbs — open positions need monitoring too.
-        try:
-            mon = await position_monitor.monitor_open_positions(
-                self.db, self.kalshi, self.poly, self.exit_cfg,
-                dry_run=self.cfg.get("dry_run", True),
-                fee_cfg=self.cfg.get("fees", {}),
-            )
-            if mon["n_open"] > 0:
-                log.info(
-                    "Monitor: open=%d marked=%d UNWIND=%d CLOSED=%d WATCH=%d HOLD=%d skipped=%d realized_this_cycle=$%.2f",
-                    mon["n_open"], mon["n_marked"],
-                    mon["partial_unwinds"], mon["fully_closed"],
-                    mon["watches"], mon["holds"], mon["skipped"],
-                    mon["realized_this_cycle"],
-                )
-        except Exception as e:
-            log.error("Position monitor error: %s", e, exc_info=True)
+        # NOTE: position_monitor used to run here at the end of each entry-side
+        # cycle (~2-3 min cadence). It was moved to a dedicated 15s hot loop
+        # (monitor_loop) so we react to bid-book moves at sub-minute cadence
+        # without waiting for the slow market-wide scan. See main.py for the
+        # task wiring.
 
         log.info(
             "Poll done — Kalshi:%d Poly:%d pairs:%d verified:%d opps:%d alerted:%d",
             len(k_markets), len(p_markets), len(pairs), len(verified_pairs), len(raw_opps), alerted,
         )
+
+    async def monitor_loop(self):
+        """Hot loop for marking and exiting open positions.
+
+        Runs independently of the entry-side poll cycle. Every
+        monitor_interval_seconds we fetch bid books for ALL open positions
+        concurrently and re-decide HOLD/WATCH/PARTIAL_UNWIND. The entry
+        scan touches 15,000 markets and takes ~2-3 min; arb-converged
+        windows on positions we already hold can open and close in 30s.
+        Polling positions on the slow cycle systematically misses them.
+        """
+        polling_cfg = self.cfg.get("polling", {})
+        interval = float(polling_cfg.get("monitor_interval_seconds", 15))
+        max_concurrent = int(polling_cfg.get("monitor_max_concurrent", 8))
+        log.info(
+            "Position monitor loop started — interval %.0fs, max %d concurrent book fetches",
+            interval, max_concurrent,
+        )
+        while True:
+            try:
+                mon = await position_monitor.monitor_open_positions(
+                    self.db, self.kalshi, self.poly, self.exit_cfg,
+                    dry_run=self.cfg.get("dry_run", True),
+                    fee_cfg=self.cfg.get("fees", {}),
+                    max_concurrent=max_concurrent,
+                )
+                if mon["n_open"] > 0:
+                    log.info(
+                        "Monitor: open=%d marked=%d UNWIND=%d CLOSED=%d WATCH=%d HOLD=%d skipped=%d realized_this_cycle=$%.2f",
+                        mon["n_open"], mon["n_marked"],
+                        mon["partial_unwinds"], mon["fully_closed"],
+                        mon["watches"], mon["holds"], mon["skipped"],
+                        mon["realized_this_cycle"],
+                    )
+            except Exception as e:
+                log.error("Monitor loop error: %s", e, exc_info=True)
+            await asyncio.sleep(interval)
 
     async def _refresh_polymarket_clob(self, pairs):
         """Replace Polymarket Gamma prices with live CLOB ask prices.

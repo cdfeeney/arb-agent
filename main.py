@@ -27,19 +27,29 @@ async def main() -> None:
         feed_task = asyncio.create_task(agent.btc_feed.run(), name="btc_feed")
         log.info("BTC feed task started")
 
+    monitor_task: asyncio.Task | None = None
+
     try:
         if "--once" in sys.argv:
             await agent._poll_once()
         else:
+            # Position monitor runs as a separate task on its own cadence
+            # (typically 15s) so we react to book moves on currently-held
+            # positions without waiting for the slow ~2-3 min entry scan.
+            monitor_task = asyncio.create_task(agent.monitor_loop(), name="monitor_loop")
+            log.info("Position monitor task started")
             await agent.run()
     finally:
-        if feed_task is not None:
-            agent.btc_feed.stop() if agent.btc_feed else None
-            feed_task.cancel()
+        for task in (monitor_task, feed_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await feed_task
+                await task
             except (asyncio.CancelledError, Exception):
                 pass
+        if agent.btc_feed is not None:
+            agent.btc_feed.stop()
 
 
 if __name__ == "__main__":
