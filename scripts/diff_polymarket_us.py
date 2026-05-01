@@ -91,30 +91,68 @@ async def main() -> None:
             else:
                 print(f"  US lookup failed for {s}: {resp.status_code}")
     else:
-        print(f"Pulling US active markets, sorting by volume…")
-        us_all = await poly_us.fetch_markets(limit=100, active=True, closed=False)
-        # Volume field: try volumeNum then volume
-        def _vol(m: dict) -> float:
-            v = m.get("volumeNum") or m.get("volume") or 0
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return 0.0
-        us_all.sort(key=_vol, reverse=True)
+        print(f"Pulling US active markets…")
+        us_all = await poly_us.fetch_markets(limit=200, active=True, closed=False)
 
-        print(f"  US has {len(us_all)} active markets. Top 15 by volume:")
+        # US uses different volume/activity field names than intl. Try a list
+        # of plausible names and use the first non-zero one. The previous
+        # `volumeNum` was 0 across all 1144 markets, so the sort was random.
+        VOLUME_FIELDS = (
+            "volumeNum", "volume", "volume24Hr", "volume24hr", "volume24h",
+            "totalVolume", "openInterest", "liquidity", "liquidityNum",
+            "tradeCount", "lastPriceSampleVolume",
+        )
+
+        def _activity_score(m: dict) -> float:
+            for f in VOLUME_FIELDS:
+                v = m.get(f)
+                if v is None:
+                    continue
+                try:
+                    n = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if n > 0:
+                    return n
+            return 0.0
+
+        us_all.sort(key=_activity_score, reverse=True)
+
+        # Diagnostic: which field is actually populated on the first market?
+        if us_all:
+            sample = us_all[0]
+            populated = {k: sample.get(k) for k in VOLUME_FIELDS if sample.get(k)}
+            print(
+                f"  Diagnostic — activity fields populated on top market: "
+                f"{populated or '(NONE — all zero/missing)'}"
+            )
+            print(
+                f"  All non-empty top-level field names on first US market: "
+                f"{sorted(k for k, v in sample.items() if v not in (None, '', 0, [], {}))}"
+            )
+
+        print(f"\n  US has {len(us_all)} active markets. Top 15 by activity:")
         for m in us_all[:15]:
             cat = m.get("category") or ""
             print(
-                f"    [{cat:12s}] vol={_vol(m):>10,.0f}  "
+                f"    [{cat:12s}] act={_activity_score(m):>12,.2f}  "
                 f"{(m.get('slug') or '')[:50]:50s}  "
                 f"{(m.get('question') or '')[:55]}"
             )
         print()
 
-        # Pick top N. Don't filter by category — US has sports, crypto, politics.
-        # We want a mix to see if prices align across categories.
-        us_picks = us_all[: args.limit]
+        # Skip "future-event" markets with zero activity — they will all
+        # have flat 50¢ prices and dominate the list when nothing has
+        # actual volume yet.
+        active_only = [m for m in us_all if _activity_score(m) > 0]
+        if active_only:
+            us_picks = active_only[: args.limit]
+        else:
+            print(
+                "  WARNING: no US market has any populated activity field — "
+                "falling back to first N regardless.\n"
+            )
+            us_picks = us_all[: args.limit]
 
     if not us_picks:
         print("No US markets to compare.\n")
@@ -160,7 +198,10 @@ async def main() -> None:
 
         # Find matching intl market by question text via Gamma full-text search.
         # Then validate the match by token overlap so a junk hit doesn't
-        # silently distort the diff.
+        # silently distort the diff. Use a *ratio* rule rather than an
+        # absolute count so short questions ("NBA MVP" = 2 tokens) can match
+        # while still rejecting unrelated long-question pairings (Hungary PM
+        # vs FlyQuest LoL = 0 overlap).
         intl: dict | None = None
         intl_match_question = None
         if us_question:
@@ -175,15 +216,24 @@ async def main() -> None:
                     candidates = resp.json() or []
                     us_tokens = _norm_tokens(us_question)
                     best_overlap = 0
+                    best_min_len = 0
                     for c in candidates:
                         c_q = c.get("question") or ""
-                        overlap = len(us_tokens & _norm_tokens(c_q))
+                        c_tokens = _norm_tokens(c_q)
+                        if not c_tokens or not us_tokens:
+                            continue
+                        overlap = len(us_tokens & c_tokens)
                         if overlap > best_overlap:
                             best_overlap = overlap
+                            best_min_len = min(len(us_tokens), len(c_tokens))
                             intl = c
                             intl_match_question = c_q
-                    # Reject low-similarity matches (need >=3 shared substantive tokens).
-                    if best_overlap < 3:
+                    # Match rule: at least 2 shared tokens AND those tokens
+                    # cover ≥50% of the SHORTER question. This passes
+                    # "NBA MVP"↔"NBA MVP" (2/2=100%) and rejects
+                    # "Bitcoin $150k"↔"Bitcoin $200k" (1 shared, 1/3=33%).
+                    needed = max(2, (best_min_len + 1) // 2)
+                    if best_overlap < needed:
                         intl = None
                         intl_match_question = None
             except Exception as e:
