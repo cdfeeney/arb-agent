@@ -170,7 +170,17 @@ exit:
   annualized_multiple: 1.5          # exit if early-exit annualized > 1.5× hold annualized
   max_slippage_pct: 0.02            # downgrade EXIT to HOLD if VWAP slips >2% from best bid
   cooldown_minutes: 60              # don't re-enter exited pairs for this long
-  min_days_remaining_to_force_hold: 0.5   # within 12h of resolution, always hold
+  min_days_remaining_to_force_hold: 0.25  # within 6h of resolution, default to hold.
+                                          # Lowered from 0.5 (12h) on 2026-05-01 per
+                                          # profit-ideas #3 — the 6-12h window often
+                                          # has profitable spreads we were force-holding
+                                          # through. The new spike-capture override
+                                          # below also fires within this 6h window.
+  near_resolution_spike_fee_multiple: 2.0 # within force-hold window, override HOLD only
+                                          # if net realized > exit_fees × this multiple.
+                                          # Default 2x means the spike must be clearly
+                                          # real (covers exit fees and doubles them in
+                                          # profit) not just barely-above-zero.
   partial_unwind_min_size: 0.1      # smallest unwind worth executing (in contracts).
                                     # With $1-3 stakes on $100 bankroll, positions hold
                                     # 1-3 contracts; 0.1 lets the monitor exit fractionally

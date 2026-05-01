@@ -38,6 +38,8 @@ class ExitConfig:
     cooldown_minutes: int               # re-entry cooldown after exit
     min_days_remaining_to_force_hold: float  # very-near-resolution: hold
     partial_unwind_min_size: float      # smallest unwind worth executing (contracts)
+    near_resolution_spike_fee_multiple: float  # within force-hold window, only override
+                                                # if net realized > exit_fees × this
 
     @classmethod
     def from_dict(cls, d: dict) -> "ExitConfig":
@@ -48,9 +50,12 @@ class ExitConfig:
             max_slippage_pct=float(d.get("max_slippage_pct", 0.02)),  # 2%
             cooldown_minutes=int(d.get("cooldown_minutes", 60)),
             min_days_remaining_to_force_hold=float(
-                d.get("min_days_remaining_to_force_hold", 0.5)
+                d.get("min_days_remaining_to_force_hold", 0.25)
             ),
             partial_unwind_min_size=float(d.get("partial_unwind_min_size", 1.0)),
+            near_resolution_spike_fee_multiple=float(
+                d.get("near_resolution_spike_fee_multiple", 2.0),
+            ),
         )
 
 
@@ -166,7 +171,14 @@ def _decide(
 
     # Force-hold near resolution: the spread cost on a partial unwind likely
     # exceeds the annualized-return benefit when resolution is hours away.
+    # EXCEPT (profit ideas #3): resolution-time books often show last-minute
+    # speculative spikes that disappear within minutes. If the unwind would
+    # clear cost + N × exit_fees right now (default N=2), take it — that
+    # spike is real and won't last. Otherwise hold for full payout.
     if mark.days_remaining < cfg.min_days_remaining_to_force_hold:
+        spike = _try_resolution_spike_capture(mark, cfg, fee_cfg)
+        if spike is not None:
+            return spike
         return "HOLD", f"resolves in {mark.days_remaining:.2f}d, hold for full payout", 0.0
 
     # Either bid book unavailable → can't unwind either leg.
@@ -249,6 +261,62 @@ def _decide(
         f"top-of-book {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} > "
         f"cost {mark.cost_per_contract:.4f}, sell {raw_size:.2f} contracts "
         f"net ${net_realized:.2f} (gross ${gross_realized:.2f} - fees ${exit_fees:.2f})",
+        raw_size,
+    )
+
+
+def _try_resolution_spike_capture(
+    mark: TradeMark,
+    cfg: ExitConfig,
+    fee_cfg: dict | None,
+) -> tuple[str, str, float] | None:
+    """Profit ideas #3: resolution-time spike capture.
+
+    Within the force-hold window (final hours before resolution), the default
+    is HOLD — the spread + exit-fee drag on a near-zero-time-decay position
+    isn't worth it. BUT resolution-time books often see a brief speculative
+    spike that reverts within minutes. If the bid book RIGHT NOW would clear
+    cost + N × exit_fees (default N=2), the spike is real and we should
+    take it instead of waiting for resolution and the spike to vanish.
+
+    Returns (action, reason, size) tuple to override HOLD, or None to
+    fall through to the normal force-hold path.
+    """
+    if not mark.yes_leg.book_available or not mark.no_leg.book_available:
+        return None
+    yes_bid = mark.yes_leg.best_bid
+    no_bid = mark.no_leg.best_bid
+    if yes_bid <= 0 or no_bid <= 0:
+        return None
+    sum_bids = yes_bid + no_bid
+    gross_per = sum_bids - mark.cost_per_contract
+    if gross_per <= 0:
+        return None
+    raw_size = min(
+        mark.yes_leg.best_bid_size,
+        mark.no_leg.best_bid_size,
+        mark.contracts_remaining,
+    )
+    if raw_size < cfg.partial_unwind_min_size:
+        return None
+    exit_fees = 0.0
+    if fee_cfg is not None and mark.buy_yes is not None and mark.buy_no is not None:
+        exit_fees = compute_unwind_fees(
+            mark.buy_yes, mark.buy_no, yes_bid, no_bid, raw_size, fee_cfg,
+        )
+    gross_realized = gross_per * raw_size
+    net_realized = gross_realized - exit_fees
+    # Stricter threshold than the normal path: require the spike to be
+    # clearly real (net > N × exit_fees), not just barely-above-zero.
+    threshold = exit_fees * cfg.near_resolution_spike_fee_multiple
+    if net_realized < threshold:
+        return None
+    return (
+        "PARTIAL_UNWIND",
+        f"resolution-spike capture: {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} "
+        f"vs cost {mark.cost_per_contract:.4f}, sell {raw_size:.2f} contracts "
+        f"net ${net_realized:.2f} > {cfg.near_resolution_spike_fee_multiple:.1f}× "
+        f"exit_fees ${exit_fees:.2f}",
         raw_size,
     )
 
