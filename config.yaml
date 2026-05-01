@@ -8,6 +8,20 @@ polling:
                                       # scan so we can react to book moves at sub-minute
                                       # cadence without waiting for the slow market-wide poll.
   monitor_max_concurrent: 8           # books fetched in parallel per monitor cycle
+  # Two-tier polling (#24): cold scan (above) does the universe-wide
+  # match + LLM verification ~30s. Hot scan re-polls just the books for
+  # already-verified pairs at sub-10s cadence so we catch convergence
+  # inside the cold-cycle window.
+  hot_interval_seconds: 10            # cadence for re-polling verified-pair books.
+                                      # Conservative starting value — at hot_max_pairs=30
+                                      # we hit ~6 req/sec aggregate (3 Kalshi + 3 Poly).
+                                      # Drop to 5 once we observe rate-limit headroom.
+  hot_max_pairs: 30                   # cap concurrent book fetches per hot cycle.
+                                      # Cold cycle typically yields 1-3 verified pairs;
+                                      # 30 is plenty of headroom across cumulative cold
+                                      # cycles within the TTL window.
+  hot_pair_ttl_seconds: 1800          # evict pairs not re-verified within 30 min
+                                      # (market closed, went illiquid, lost match)
 
 kalshi:
   base_url: "https://trading-api.kalshi.com/trade-api/v2"

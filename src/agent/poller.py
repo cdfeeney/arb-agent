@@ -52,6 +52,13 @@ class PollingAgent:
             )
         self.exit_cfg = position_monitor.ExitConfig.from_dict(config.get("exit", {}))
 
+        # Two-tier polling state (#24): cold loop populates the hot list with
+        # verified pairs; hot loop re-polls just those books at sub-10s
+        # cadence to catch convergence as it happens. Key = (platform_a,
+        # ticker_a, platform_b, ticker_b) tuple — uniquely identifies a pair.
+        # Value = (market_a, market_b, added_at_monotonic).
+        self._hot_pairs: dict[tuple, tuple[dict, dict, float]] = {}
+
         exec_cfg = config.get("execution", {}) or {}
         self.exec_mode = (exec_cfg.get("mode") or "log_only").lower()
         self.allow_send = bool(exec_cfg.get("allow_send", False))
@@ -180,6 +187,11 @@ class PollingAgent:
         verified_pairs = await self._refresh_polymarket_clob(verified_pairs)
         verified_pairs = await self._fetch_kalshi_books(verified_pairs)
 
+        # Update the hot list (#24): every verified pair seen this cold cycle
+        # joins the hot list with a fresh timestamp; pairs older than the TTL
+        # are evicted. Hot loop polls just these books at sub-10s cadence.
+        self._update_hot_pairs(verified_pairs)
+
         raw_opps = []
         for a, b in verified_pairs:
             opp = detect_arb(
@@ -192,6 +204,21 @@ class PollingAgent:
 
         opportunities = apply_active_promos(raw_opps, self.cfg["promotions"]["active"])
 
+        alerted = await self._process_opportunities(opportunities)
+
+        log.info(
+            "Poll done — Kalshi:%d Poly:%d pairs:%d verified:%d opps:%d alerted:%d hot:%d",
+            len(k_markets), len(p_markets), len(pairs), len(verified_pairs),
+            len(raw_opps), alerted, len(self._hot_pairs),
+        )
+
+    async def _process_opportunities(self, opportunities: list[dict]) -> int:
+        """Eligibility → allocator → executor pipeline.
+
+        Shared by cold scan (`_poll_once`) and hot scan (`hot_loop`). The
+        dedup/cooldown checks below ensure the same pair_id from both loops
+        doesn't double-fire.
+        """
         # Phase 1: eligibility — dedup, cooldown, sizing min_bet
         eligible: list[tuple[dict, dict]] = []
         cooldown_minutes = self.exit_cfg.cooldown_minutes
@@ -270,16 +297,84 @@ class PollingAgent:
                 )
             alerted += 1
 
-        # NOTE: position_monitor used to run here at the end of each entry-side
-        # cycle (~2-3 min cadence). It was moved to a dedicated 15s hot loop
-        # (monitor_loop) so we react to bid-book moves at sub-minute cadence
-        # without waiting for the slow market-wide scan. See main.py for the
-        # task wiring.
+        # NOTE: position_monitor and hot_loop run as separate asyncio tasks,
+        # not at the end of each cold cycle. See main.py for task wiring.
+        return alerted
 
+    def _update_hot_pairs(self, verified_pairs: list[tuple[dict, dict]]) -> None:
+        """Refresh the hot-pair list with this cold cycle's verified pairs.
+
+        Each pair joins or refreshes its timestamp. Pairs not seen within
+        `hot_pair_ttl_seconds` (default 1800 = 30 min) are evicted; the
+        market or its match might have closed, gone illiquid, or stopped
+        being arbageable.
+        """
+        import time
+        now = time.monotonic()
+        for a, b in verified_pairs:
+            key = (a.get("platform"), a.get("ticker"), b.get("platform"), b.get("ticker"))
+            self._hot_pairs[key] = (a, b, now)
+        ttl = float(self.cfg.get("polling", {}).get("hot_pair_ttl_seconds", 1800))
+        before = len(self._hot_pairs)
+        self._hot_pairs = {
+            k: (a, b, t)
+            for k, (a, b, t) in self._hot_pairs.items()
+            if now - t < ttl
+        }
+        evicted = before - len(self._hot_pairs)
+        if evicted:
+            log.info("Hot pairs: evicted %d (TTL %.0fs)", evicted, ttl)
+
+    async def hot_loop(self):
+        """Sub-10s loop that polls JUST the books for currently-hot pairs.
+
+        Cold loop (~30s) does the universe-wide scan + matching + LLM
+        verification — expensive, slow. Hot loop is the cheap follow-up:
+        for the ≤N pairs already verified, refresh both legs' books and
+        re-detect arbs. Catches convergence inside the cold-cycle window.
+
+        Cap: `hot_max_pairs` (default 50) — keep concurrent CLOB/Kalshi
+        fetches bounded.
+        """
+        polling_cfg = self.cfg.get("polling", {})
+        interval = float(polling_cfg.get("hot_interval_seconds", 5))
+        max_pairs = int(polling_cfg.get("hot_max_pairs", 50))
+        flt = self.cfg["filters"]
         log.info(
-            "Poll done — Kalshi:%d Poly:%d pairs:%d verified:%d opps:%d alerted:%d",
-            len(k_markets), len(p_markets), len(pairs), len(verified_pairs), len(raw_opps), alerted,
+            "Hot pair loop started — interval %.0fs, max %d pairs",
+            interval, max_pairs,
         )
+        while True:
+            try:
+                if self._hot_pairs:
+                    # Newest first — most-recently verified pairs get priority
+                    sorted_items = sorted(
+                        self._hot_pairs.items(), key=lambda kv: -kv[1][2],
+                    )[:max_pairs]
+                    pairs = [(a, b) for (_, (a, b, _)) in sorted_items]
+                    refreshed = await self._refresh_polymarket_clob(pairs)
+                    refreshed = await self._fetch_kalshi_books(refreshed)
+                    raw_opps = []
+                    for a, b in refreshed:
+                        opp = detect_arb(
+                            a, b,
+                            threshold=1.0 - flt["min_profit_pct"],
+                            min_hours_to_close=flt["min_hours_to_close"],
+                        )
+                        if opp:
+                            raw_opps.append(opp)
+                    if raw_opps:
+                        opportunities = apply_active_promos(
+                            raw_opps, self.cfg["promotions"]["active"],
+                        )
+                        alerted = await self._process_opportunities(opportunities)
+                        log.info(
+                            "Hot scan: %d hot pairs → %d opps → %d alerted",
+                            len(pairs), len(raw_opps), alerted,
+                        )
+            except Exception as e:
+                log.error("Hot loop error: %s", e, exc_info=True)
+            await asyncio.sleep(interval)
 
     async def monitor_loop(self):
         """Hot loop for marking and exiting open positions.
