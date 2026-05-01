@@ -204,6 +204,19 @@ def _decide(
             raw_size,
         )
 
+    # Slippage gate: previously max_slippage_pct was declared on ExitConfig
+    # but never read. _build_mark already computes mark.slippage_pct (avg
+    # shortfall vwap-vs-bid across legs). If slippage on this unwind would
+    # exceed the configured cap, downgrade to WATCH — better to wait for a
+    # cleaner book than to pay the spread on a thin unwind.
+    if mark.slippage_pct > cfg.max_slippage_pct:
+        return (
+            "WATCH",
+            f"slippage {mark.slippage_pct:.1%} > max {cfg.max_slippage_pct:.1%} "
+            f"— book too thin to unwind cleanly",
+            raw_size,
+        )
+
     # Fee gate: exit fees on selling `raw_size` contracts on both legs at the
     # current bids. If we don't clear those fees, holding to resolution is
     # strictly better — we already paid entry fees, exit fees on a barely-
@@ -379,6 +392,19 @@ async def _build_mark(
     no_size_usd = float(trade["no_size_usd"] or 0)
 
     if yes_contracts_orig <= 0 or no_contracts_orig <= 0:
+        return None
+
+    # Reject any trade with missing/zero entry prices. cost_per_contract
+    # would be 0 → gross_profit would be a fabricated win on every cycle
+    # (cycle keeps firing PARTIAL_UNWIND until contracts_remaining hits 0,
+    # producing a 'closed' row with garbage realized profit). This was a
+    # likely contributor to the 159 status='closed' realized=NULL trades.
+    if yes_paid <= 0 or no_paid <= 0:
+        log.warning(
+            "monitor: trade #%s skipped — entry price missing "
+            "(yes_paid=%.4f no_paid=%.4f)",
+            trade.get("id"), yes_paid, no_paid,
+        )
         return None
 
     # contracts_remaining tracks live position size; fall back to original

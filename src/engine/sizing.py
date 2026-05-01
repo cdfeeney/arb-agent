@@ -21,14 +21,30 @@ Rules applied in order (each can only reduce the bet size):
   6. Min bet floor     — hard floor from config
 """
 
+import logging
+
 from .fees import compute_arb_fees
+
+log = logging.getLogger(__name__)
 
 
 def size_position(opportunity: dict, cfg: dict) -> dict:
     edge = opportunity["profit_pct"]
     yes_price = opportunity["buy_yes"]["yes_price"]
     no_price = opportunity["buy_no"]["no_price"]
-    cost_per_contract = max(yes_price + no_price, 0.01)
+
+    # Reject if either price is missing/zero. Previously we floored
+    # cost_per_contract at 0.01 which inflated Kelly 100x for 0-priced
+    # legs (e.g. fake-cheap due to a normalizer bug). Distinguish "missing
+    # data" from "1 cent contract" — both shouldn't be silently equated.
+    if yes_price <= 0 or no_price <= 0:
+        log.warning(
+            "size_position rejected: yes=%.4f no=%.4f (zero price = missing "
+            "data, not 1¢ contract)",
+            yes_price, no_price,
+        )
+        return _reject_sizing(opportunity, "zero_or_missing_price")
+    cost_per_contract = yes_price + no_price
 
     vol_yes_usd = opportunity["buy_yes"].get("volume", 0)
     vol_no_usd = opportunity["buy_no"].get("volume", 0)
@@ -49,33 +65,58 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
         max_contracts_liquidity = min(max_contracts_by_yes_side, max_contracts_by_no_side)
         liquidity_cap = max_contracts_liquidity * cost_per_contract
     else:
-        liquidity_cap = bankroll_cap  # fallback when volume data missing
+        # Volume missing on at least one leg — clamp to min_bet floor instead
+        # of releasing the cap. "Don't know" should shrink the bet, not
+        # remove the constraint entirely.
+        liquidity_cap = float(cfg.get("min_bet", 5))
+        log.info(
+            "sizing liquidity cap: missing volume (yes=%s no=%s) → clamp to "
+            "min_bet $%.2f", vol_yes_usd, vol_no_usd, liquidity_cap,
+        )
 
     # 4. Book-depth cap — bound entry by the bid-side liquidity we'll need for
     # unwind. Each leg's contract count is capped by `book_depth_fraction` of
-    # that side's bid-book USD depth. Convert leg-USD caps back to a total-
-    # stake cap via cost_per_contract. This enforces the user's "$10 → $1"
-    # principle: take small positions in shallow markets, larger in deep ones.
+    # that side's bid-book USD depth. Use BID prices in the denominator (not
+    # ask) since bid-side USD/bid-side price is the contract count we can
+    # actually unload at the top of book.
     depth_fraction = float(cfg.get("book_depth_fraction", 0.25))
     yes_bid_depth = float(opportunity["buy_yes"].get("yes_bid_depth_usd", 0) or 0)
     no_bid_depth = float(opportunity["buy_no"].get("no_bid_depth_usd", 0) or 0)
-    if yes_bid_depth > 0 and no_bid_depth > 0:
+    yes_bid = float(opportunity["buy_yes"].get("yes_bid", 0) or yes_price)
+    no_bid = float(opportunity["buy_no"].get("no_bid", 0) or no_price)
+    if yes_bid_depth > 0 and no_bid_depth > 0 and yes_bid > 0 and no_bid > 0:
         max_yes_unwind_usd = yes_bid_depth * depth_fraction
         max_no_unwind_usd = no_bid_depth * depth_fraction
-        max_contracts_yes_depth = max_yes_unwind_usd / max(yes_price, 0.01)
-        max_contracts_no_depth = max_no_unwind_usd / max(no_price, 0.01)
+        max_contracts_yes_depth = max_yes_unwind_usd / yes_bid
+        max_contracts_no_depth = max_no_unwind_usd / no_bid
         max_contracts_depth = min(max_contracts_yes_depth, max_contracts_no_depth)
         book_depth_cap = max_contracts_depth * cost_per_contract
     else:
-        # Bid depth unavailable — fall back to bankroll cap so we don't reject
-        # the trade entirely. Logged as "depth unknown" via limiting_rule.
-        book_depth_cap = bankroll_cap
+        # Bid depth unavailable — clamp to min_bet, NOT bankroll. Previously
+        # we removed the cap, which on a $100 account meant "no depth data"
+        # could send full bankroll into a position with unverifiable exit.
+        book_depth_cap = float(cfg.get("min_bet", 5))
+        log.warning(
+            "sizing book-depth cap: missing depth (yes_dep=%.2f no_dep=%.2f "
+            "yes_bid=%.4f no_bid=%.4f) → clamp to min_bet $%.2f",
+            yes_bid_depth, no_bid_depth, yes_bid, no_bid, book_depth_cap,
+        )
 
-    # Apply all caps
+    # Apply all caps. Note: NO min_bet floor here — if computed stake is
+    # below min_bet, the caller should drop the opportunity entirely
+    # (the previous floor silently up-sized past safety caps).
     total_stake = min(
         kelly_stake, bankroll_cap, liquidity_cap, book_depth_cap, cfg["max_bet"],
     )
-    total_stake = max(total_stake, cfg["min_bet"])
+    if total_stake < float(cfg.get("min_bet", 5)):
+        log.info(
+            "size_position rejected: total_stake $%.2f < min_bet $%.2f "
+            "(limiting cap was %s)",
+            total_stake, cfg["min_bet"],
+            _find_limiting_rule(kelly_stake, bankroll_cap, liquidity_cap,
+                                book_depth_cap, cfg["max_bet"]),
+        )
+        return _reject_sizing(opportunity, "below_min_bet")
 
     # Translate total stake to contracts, then split into legs
     n_contracts = total_stake / cost_per_contract
@@ -136,3 +177,30 @@ def _find_limiting_rule(
         "max_bet": max_bet,
     }
     return min(caps, key=lambda k: caps[k])
+
+
+def _reject_sizing(opportunity: dict, reason: str) -> dict:
+    """Return a zero-size sizing dict so the caller can detect rejection
+    via `bet_size == 0` and skip the opportunity rather than silently
+    proceeding with a corrupt position size."""
+    return {
+        "bet_size": 0.0,
+        "contracts": 0.0,
+        "leg_yes": {
+            "platform": opportunity.get("buy_yes", {}).get("platform", ""),
+            "usd": 0.0, "contracts": 0.0,
+        },
+        "leg_no": {
+            "platform": opportunity.get("buy_no", {}).get("platform", ""),
+            "usd": 0.0, "contracts": 0.0,
+        },
+        "guaranteed_payout": 0.0,
+        "gross_profit": 0.0,
+        "net_profit": 0.0,
+        "net_profit_pct": 0.0,
+        "fees": {"worst_case_total": 0.0, "entry_total": 0.0,
+                 "entry_yes": 0.0, "entry_no": 0.0},
+        "kelly_raw": 0.0,
+        "limiting_rule": f"REJECTED:{reason}",
+        "sizing_caps": {},
+    }

@@ -79,6 +79,53 @@ class Database:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status, closes_at)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_paper_pair ON paper_trades(pair_id, detected_at)")
 
+            # One-time cleanup: tag legacy unresolved-close rows so they don't
+            # pollute paper_summary stats AND so the new triggers (below)
+            # don't choke on existing bad state. Move them to a 'legacy_broken'
+            # status that's neither 'closed' nor 'exited' — paper_summary will
+            # show them in a separate bucket the user can ignore.
+            await db.execute(
+                """UPDATE paper_trades
+                   SET status='legacy_broken'
+                   WHERE status IN ('closed','exited')
+                     AND realized_profit_usd IS NULL"""
+            )
+
+            # Invariant guard: any trade marked status='closed' or 'exited'
+            # MUST also have realized_profit_usd populated. Otherwise
+            # paper_summary reports "(unresolved)" and we lose strategy P&L.
+            #
+            # Backstory: 2026-04-30 we found 159 rows with status='closed' but
+            # realized_profit_usd=NULL even though every code path that writes
+            # 'closed' (apply_partial_unwind) writes realized atomically. Either
+            # an unidentified rogue writer existed or the running bot was on
+            # stale code. The triggers below make the impossible state
+            # literally impossible going forward — any regression surfaces as
+            # a SQLite constraint error in logs (caught by the wrapped commit
+            # in apply_partial_unwind) instead of silently producing
+            # unresolved data.
+            await db.execute("""
+                CREATE TRIGGER IF NOT EXISTS enforce_closed_has_realized
+                BEFORE UPDATE OF status ON paper_trades
+                FOR EACH ROW
+                WHEN NEW.status = 'closed' AND NEW.realized_profit_usd IS NULL
+                BEGIN
+                    SELECT RAISE(ABORT,
+                        'cannot mark trade closed without realized_profit_usd');
+                END
+            """)
+            # Same invariant for status='exited' — also writes realized.
+            await db.execute("""
+                CREATE TRIGGER IF NOT EXISTS enforce_exited_has_realized
+                BEFORE UPDATE OF status ON paper_trades
+                FOR EACH ROW
+                WHEN NEW.status = 'exited' AND NEW.realized_profit_usd IS NULL
+                BEGIN
+                    SELECT RAISE(ABORT,
+                        'cannot mark trade exited without realized_profit_usd');
+                END
+            """)
+
             # Lag signals: directional bets driven by underlying price moves
             # (e.g. BTC moves but Kalshi crypto market hasn't repriced yet).
             # See LAG_DESIGN.md for the data flow and signal model.
@@ -578,8 +625,17 @@ class Database:
             )
             row = await cur.fetchone()
             if row is None:
+                log.warning(
+                    "apply_partial_unwind: trade_id=%s not found or not open — "
+                    "skipping write (caller passed unwind_size=%.4f, realized=%.4f)",
+                    trade_id, unwind_size, realized_usd,
+                )
+                # Returning fully_closed=True would cause the position monitor
+                # to log "CLOSED ... realized $0.00" and add a cooldown for a
+                # trade that was never legitimately closed. Use False so the
+                # caller skips the close path entirely on this no-op write.
                 return {"contracts_remaining": 0, "partial_realized_usd": 0,
-                        "fully_closed": True}
+                        "fully_closed": False}
             cur_remaining = float(row["contracts_remaining"] or 0)
             cur_realized = float(row["partial_realized_usd"] or 0)
             entry_fees = float(row["fees_estimated_usd"] or 0)
@@ -588,6 +644,15 @@ class Database:
             fully_closed = new_remaining <= 0.0001  # float tolerance
             if fully_closed:
                 final_realized = round(new_realized - entry_fees, 4)
+                log.info(
+                    "apply_partial_unwind FULL CLOSE trade=%d "
+                    "cur_remaining=%.4f unwind_size=%.4f new_remaining=%.4f "
+                    "cur_partial_realized=%.4f this_realized=%.4f "
+                    "new_partial=%.4f entry_fees=%.4f final_realized=%.4f",
+                    trade_id, cur_remaining, unwind_size, new_remaining,
+                    cur_realized, realized_usd, new_realized, entry_fees,
+                    final_realized,
+                )
                 await db.execute(
                     """UPDATE paper_trades SET
                            contracts_remaining=0,
@@ -606,7 +671,18 @@ class Database:
                     "WHERE id=?",
                     (round(new_remaining, 4), new_realized, trade_id),
                 )
-            await db.commit()
+            try:
+                await db.commit()
+            except Exception as e:
+                # Trigger fired or other constraint failure: surface loudly so
+                # the next monitor cycle can be debugged instead of producing
+                # silently broken data.
+                log.error(
+                    "apply_partial_unwind COMMIT FAILED for trade=%d "
+                    "(fully_closed=%s): %s",
+                    trade_id, fully_closed, e, exc_info=True,
+                )
+                raise
             return {
                 "contracts_remaining": round(new_remaining, 4),
                 "partial_realized_usd": new_realized,

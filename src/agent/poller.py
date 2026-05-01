@@ -233,14 +233,24 @@ class PollingAgent:
             yes_ask, yes_ask_size = self.poly.best_ask_from_book(yes_book)
             no_ask,  no_ask_size  = self.poly.best_ask_from_book(no_book)
             if yes_ask <= 0 or no_ask <= 0:
-                # CLOB unavailable — keep Gamma price but flag low confidence
-                return m
+                # CLOB unavailable — explicit flag so downstream filtering
+                # can drop the pair rather than trusting stale Gamma prices
+                # (Gamma has been observed off by 16¢ in our pipeline-lessons
+                # memory). Don't return Gamma prices unmodified.
+                log.warning(
+                    "CLOB unavailable for %s — yes_ask=%.4f no_ask=%.4f; "
+                    "marking _clob_refreshed=False so pair is dropped",
+                    m.get("ticker", "?"), yes_ask, no_ask,
+                )
+                return {**m, "_clob_refreshed": False}
             yes_bid, yes_bid_size = self.poly.best_bid_from_book(yes_book)
             no_bid,  no_bid_size  = self.poly.best_bid_from_book(no_book)
             return {
                 **m,
                 "yes_price": round(yes_ask, 4),
                 "no_price": round(no_ask, 4),
+                "yes_bid": round(yes_bid, 4) if yes_bid > 0 else 0.0,
+                "no_bid": round(no_bid, 4) if no_bid > 0 else 0.0,
                 "yes_ask_depth_usd": round(yes_ask_size * yes_ask, 2),
                 "no_ask_depth_usd": round(no_ask_size * no_ask, 2),
                 "yes_bid_depth_usd": round(yes_bid_size * yes_bid, 2) if yes_bid > 0 else 0.0,
@@ -260,12 +270,26 @@ class PollingAgent:
         by_ticker = {m["ticker"]: m for m in refreshed}
 
         rebuilt = []
+        n_dropped = 0
         for a, b in pairs:
             a2 = by_ticker.get(a.get("ticker"), a) if a.get("platform") == "polymarket" else a
             b2 = by_ticker.get(b.get("ticker"), b) if b.get("platform") == "polymarket" else b
+            # Drop the entire pair if either Polymarket leg failed CLOB
+            # refresh. We won't trade on stale Gamma prices that the
+            # 16¢-stale incident proved we can't trust.
+            poly_legs = [
+                m for m in (a2, b2) if m.get("platform") == "polymarket"
+            ]
+            if poly_legs and not all(m.get("_clob_refreshed") for m in poly_legs):
+                n_dropped += 1
+                continue
             rebuilt.append((a2, b2))
         n_refreshed = sum(1 for m in refreshed if m.get("_clob_refreshed"))
-        log.info("CLOB refresh: %d/%d Polymarket legs updated with live order book", n_refreshed, len(unique_markets))
+        log.info(
+            "CLOB refresh: %d/%d Polymarket legs updated; dropped %d pair(s) "
+            "with stale-only Gamma data",
+            n_refreshed, len(unique_markets), n_dropped,
+        )
         return rebuilt
 
     async def _fetch_kalshi_books(self, pairs):
@@ -286,12 +310,20 @@ class PollingAgent:
                 return m
             yes_bids = book.get("yes_bids", [])
             no_bids = book.get("no_bids", [])
-            yes_bid_depth = round(sum(p * s for p, s in yes_bids[:3]), 2)
-            no_bid_depth = round(sum(p * s for p, s in no_bids[:3]), 2)
+            # Use TOP-OF-BOOK only to match Polymarket's depth definition.
+            # Previously Kalshi summed top-3 levels while Polymarket summed
+            # top-1; the same field had ~3x different semantics across
+            # platforms, systematically undersizing Polymarket arbs.
+            yes_bid = yes_bids[0][0] if yes_bids else 0.0
+            yes_bid_size = yes_bids[0][1] if yes_bids else 0.0
+            no_bid = no_bids[0][0] if no_bids else 0.0
+            no_bid_size = no_bids[0][1] if no_bids else 0.0
             return {
                 **m,
-                "yes_bid_depth_usd": yes_bid_depth,
-                "no_bid_depth_usd": no_bid_depth,
+                "yes_bid": round(yes_bid, 4),
+                "no_bid": round(no_bid, 4),
+                "yes_bid_depth_usd": round(yes_bid * yes_bid_size, 2),
+                "no_bid_depth_usd": round(no_bid * no_bid_size, 2),
                 "_kalshi_book_fetched": True,
             }
 
