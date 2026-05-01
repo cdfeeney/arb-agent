@@ -88,24 +88,75 @@ async def main():
     for (rec, cat), n in cats.most_common():
         print(f"{rec:<14} {cat:<22} {n:>6}")
 
-    if not cats:
-        return
-    (top_rec, top_cat), _ = cats.most_common(1)[0]
-    print(f"\nTop category — sample rows ({top_rec} / {top_cat}):")
-    shown = 0
-    for r in rows:
-        if r["exit_recommendation"] == top_rec and categorize_reason(r["decision_reason"]) == top_cat:
-            sb = r["sum_bids"] if r["sum_bids"] is not None else 0.0
-            cb = r["cost_basis_usd"] or 0.0
-            uv = r["unwind_value_usd"] or 0.0
-            cpc = (cb / max(0.0001, (uv if uv > 0 else cb))) if cb > 0 else 0
-            reason = (r["decision_reason"] or "")[:80]
-            print(f"  trade #{r['trade_id']:5d}  sum_bids={sb:.4f}  "
-                  f"cost_basis=${cb:.2f}  unwind_val=${uv:.2f}  "
-                  f"reason: {reason}")
-            shown += 1
-            if shown >= 10:
-                break
+    # Specific drill-down on missing_bid_book: which leg, which platform?
+    if any(categorize_reason(r["decision_reason"]) == "missing_bid_book" for r in rows):
+        print("\n=== missing_bid_book drill-down ===")
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute("""
+                SELECT pt.id AS trade_id, pt.pair_id,
+                       pt.yes_platform, pt.yes_ticker, pt.yes_token,
+                       pt.no_platform,  pt.no_ticker,  pt.no_token,
+                       m.yes_bid_now, m.no_bid_now
+                FROM paper_trade_marks m
+                JOIN paper_trades pt ON pt.id = m.paper_trade_id
+                JOIN (
+                    SELECT paper_trade_id, MAX(observed_at) AS latest
+                    FROM paper_trade_marks GROUP BY paper_trade_id
+                ) latest_m ON m.paper_trade_id = latest_m.paper_trade_id
+                           AND m.observed_at = latest_m.latest
+                WHERE pt.status='open' AND m.exit_recommendation='HOLD'
+                  AND m.decision_reason LIKE '%missing bid book%'
+            """)
+            detail = list(await cur.fetchall())
+
+        leg_status = Counter()
+        for r in detail:
+            yes_ok = (r["yes_bid_now"] or 0) > 0
+            no_ok = (r["no_bid_now"] or 0) > 0
+            yes_has_token = r["yes_token"] is not None and r["yes_token"] != ""
+            no_has_token = r["no_token"] is not None and r["no_token"] != ""
+            if yes_ok and not no_ok:
+                kind = f"NO  leg empty ({r['no_platform']:10})"
+                if r["no_platform"] == "polymarket" and not no_has_token:
+                    kind += " [no_token NULL]"
+            elif no_ok and not yes_ok:
+                kind = f"YES leg empty ({r['yes_platform']:10})"
+                if r["yes_platform"] == "polymarket" and not yes_has_token:
+                    kind += " [yes_token NULL]"
+            elif not yes_ok and not no_ok:
+                kind = "BOTH legs empty"
+            else:
+                kind = "BOTH legs have bids (anomaly)"
+            leg_status[kind] += 1
+
+        print(f"\n{'Pattern':<50} {'Count':>6}")
+        print("-" * 60)
+        for k, n in leg_status.most_common():
+            print(f"{k:<50} {n:>6}")
+
+        # Show 5 samples of the dominant pattern with full ticker info
+        if leg_status:
+            top_pattern, _ = leg_status.most_common(1)[0]
+            print(f"\nSamples of '{top_pattern}':")
+            shown = 0
+            for r in detail:
+                yes_ok = (r["yes_bid_now"] or 0) > 0
+                no_ok = (r["no_bid_now"] or 0) > 0
+                if "NO  leg empty" in top_pattern and yes_ok and not no_ok:
+                    pass
+                elif "YES leg empty" in top_pattern and no_ok and not yes_ok:
+                    pass
+                elif "BOTH legs empty" in top_pattern and not yes_ok and not no_ok:
+                    pass
+                else:
+                    continue
+                print(f"  #{r['trade_id']:4d}  yes={r['yes_platform']:10}:{r['yes_ticker'][:25]:<25} "
+                      f"no={r['no_platform']:10}:{r['no_ticker'][:25]:<25}  "
+                      f"yes_bid={r['yes_bid_now'] or 0:.3f}  no_bid={r['no_bid_now'] or 0:.3f}")
+                shown += 1
+                if shown >= 5:
+                    break
 
 
 if __name__ == "__main__":

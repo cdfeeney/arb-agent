@@ -113,9 +113,12 @@ async def _bid_mark_kalshi(
     """side: 'yes' or 'no'. Returns the bid-side liquidation profile."""
     book = await kalshi.fetch_orderbook(ticker)
     if not book:
+        log.debug("kalshi orderbook unavailable for %s (%s side)", ticker, side)
         return LegMark(0.0, 0.0, 0.0, 0.0, contracts, False)
     bids = book.get(f"{side}_bids", [])
     if not bids:
+        log.debug("kalshi orderbook %s: no %s_bids (book exists but side empty)",
+                  ticker, side)
         return LegMark(0.0, 0.0, 0.0, 0.0, contracts, False)
     best_bid, best_bid_size = bids[0][0], bids[0][1]
     vwap, filled = KalshiClient.walk_bids(bids, contracts)
@@ -127,8 +130,11 @@ async def _bid_mark_polymarket(
 ) -> LegMark:
     book = await poly.fetch_clob_book(token_id)
     if not book:
+        log.debug("polymarket CLOB unavailable for token %s...", (token_id or "")[:16])
         return LegMark(0.0, 0.0, 0.0, 0.0, contracts, False)
     best_bid, best_bid_size = PolymarketClient.best_bid_from_book(book)
+    if best_bid <= 0:
+        log.debug("polymarket CLOB empty bids for token %s...", (token_id or "")[:16])
     vwap, filled = PolymarketClient.walk_bids(book, contracts)
     return LegMark(best_bid, best_bid_size, vwap, filled, contracts, best_bid > 0)
 
