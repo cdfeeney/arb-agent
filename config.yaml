@@ -98,8 +98,13 @@ sizing:
   kelly_fraction: 1.0          # full Kelly. Rationale: cross-platform arbs are near-deterministic
                                # (both sides hedge each other); the variance that justifies
                                # quarter-Kelly comes from leg-fill risk, which our naked-leg
-                               # defense (#34) will handle separately. Until then max_bet caps
-                               # exposure at 10% of bankroll regardless of what Kelly says.
+                               # defense (#34) handles. max_bet still caps exposure at 10% of
+                               # bankroll regardless of what Kelly says.
+  kelly_low_edge_threshold: 0.03   # profit ideas #4: dynamic Kelly. Below this edge (3%),
+                                   # use half-Kelly. Slippage + naked-leg + fee variance
+                                   # eats a larger fraction of a thin edge.
+  kelly_high_edge_threshold: 0.07  # at or above this edge (7%), use full kelly_fraction.
+                                   # Linear ramp between low and high.
   liquidity_cap_pct: 0.10      # don't take more than 10% of available market volume
   book_depth_fraction: 0.25    # entry leg-USD ≤ this fraction of unwind-side bid depth.
                                # Stops phantom MTM losses by ensuring positions can be

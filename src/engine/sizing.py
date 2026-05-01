@@ -49,9 +49,21 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
     vol_yes_usd = opportunity["buy_yes"].get("volume", 0)
     vol_no_usd = opportunity["buy_no"].get("volume", 0)
 
-    # 1. Kelly: edge as fraction of stake, scaled by fractional Kelly
+    # 1. Kelly: edge as fraction of stake, scaled by fractional Kelly.
+    # Profit ideas #4: dynamic Kelly. Lower-edge arbs deserve LESS than full
+    # Kelly because variance (slippage, naked-leg risk, fee surprises) is the
+    # same in absolute terms but a larger fraction of a thin edge — a 1¢
+    # slippage wipes a 3% arb but barely dents a 7% arb. So scale the
+    # configured kelly_fraction by edge: 0.5x at low_edge_threshold,
+    # 1.0x at high_edge_threshold, linear in between.
     kelly_raw = edge / cost_per_contract
-    kelly_stake = cfg["bankroll"] * kelly_raw * cfg["kelly_fraction"]
+    effective_kelly_fraction = _dynamic_kelly_fraction(
+        edge=edge,
+        base_fraction=float(cfg["kelly_fraction"]),
+        low_edge=float(cfg.get("kelly_low_edge_threshold", 0.03)),
+        high_edge=float(cfg.get("kelly_high_edge_threshold", 0.07)),
+    )
+    kelly_stake = cfg["bankroll"] * kelly_raw * effective_kelly_fraction
 
     # 2. Bankroll cap (total stake across both legs)
     bankroll_cap = cfg["bankroll"] * cfg["max_position_pct"]
@@ -198,6 +210,30 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
             "max_bet": cfg["max_bet"],
         },
     }
+
+
+def _dynamic_kelly_fraction(
+    *, edge: float, base_fraction: float, low_edge: float, high_edge: float,
+) -> float:
+    """Scale kelly_fraction by edge.
+
+    edge ≤ low_edge:     base × 0.5 (half-Kelly — conservative on thin arbs)
+    edge ≥ high_edge:    base × 1.0 (full Kelly — confident on fat arbs)
+    in between:          linear interpolation
+
+    Rationale: variance from slippage / naked-leg risk / fee surprises is
+    roughly fixed in dollar terms, so it consumes a larger fraction of a
+    thin arb. Scaling Kelly down at low edges protects against being
+    flipped from positive- to negative-EV by routine variance.
+    """
+    if high_edge <= low_edge:
+        return base_fraction
+    if edge >= high_edge:
+        return base_fraction
+    if edge <= low_edge:
+        return base_fraction * 0.5
+    t = (edge - low_edge) / (high_edge - low_edge)
+    return base_fraction * (0.5 + 0.5 * t)
 
 
 def _find_limiting_rule(
