@@ -248,10 +248,15 @@ class PollingAgent:
                 )
                 if mon["n_open"] > 0:
                     log.info(
-                        "Monitor: open=%d marked=%d UNWIND=%d CLOSED=%d WATCH=%d HOLD=%d skipped=%d realized_this_cycle=$%.2f",
+                        "Monitor: open=%d marked=%d UNWIND=%d CLOSED=%d WATCH=%d HOLD=%d (book=%d notmoved=%d near_res=%d other=%d) skipped=%d realized_this_cycle=$%.2f",
                         mon["n_open"], mon["n_marked"],
                         mon["partial_unwinds"], mon["fully_closed"],
-                        mon["watches"], mon["holds"], mon["skipped"],
+                        mon["watches"], mon["holds"],
+                        mon.get("hold_missing_book", 0),
+                        mon.get("hold_market_not_moved", 0),
+                        mon.get("hold_near_resolution", 0),
+                        mon.get("hold_other", 0),
+                        mon["skipped"],
                         mon["realized_this_cycle"],
                     )
             except Exception as e:

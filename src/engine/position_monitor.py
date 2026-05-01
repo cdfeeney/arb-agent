@@ -278,6 +278,13 @@ async def monitor_open_positions(
         "holds": 0,
         "skipped": 0,
         "realized_this_cycle": 0.0,
+        # Per-reason HOLD tally so the live log explains WHY we're not exiting.
+        # Without this, "HOLD=193" for hours looks like a bug; with it we see
+        # whether it's missing books vs market hasn't moved vs fees-swallow.
+        "hold_missing_book": 0,
+        "hold_market_not_moved": 0,
+        "hold_near_resolution": 0,
+        "hold_other": 0,
     }
     if not cfg.enabled:
         return summary
@@ -398,6 +405,16 @@ async def monitor_open_positions(
                 )
             else:
                 summary["holds"] += 1
+                # Categorize HOLD reason for live-log breakdown
+                r = (reason or "").lower()
+                if "missing bid book" in r or "zero best-bid" in r:
+                    summary["hold_missing_book"] += 1
+                elif "<= cost" in r:
+                    summary["hold_market_not_moved"] += 1
+                elif "resolves in" in r and "hold for full" in r:
+                    summary["hold_near_resolution"] += 1
+                else:
+                    summary["hold_other"] += 1
         except Exception as e:
             log.error("monitor: trade %s error: %s", trade.get("id"), e, exc_info=True)
             summary["skipped"] += 1
