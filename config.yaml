@@ -129,6 +129,21 @@ alerts:
 database:
   path: "data/opportunities.db"
 
+# Order execution layer.
+#   log_only — write structured `orders` rows (idempotency-keyed, correlated
+#              per pair, full leg breakdown) but DO NOT hit any exchange.
+#              Same DB schema and writers as live mode, so dashboards/probes
+#              keep working when we flip the flag.
+#   live     — real Polymarket + Kalshi order placement. STUBBED in Sprint 1
+#              (raises NotImplementedError). Sprint 2 implements signing +
+#              two-leg orchestration with naked-leg defense.
+execution:
+  mode: log_only
+  naked_leg_timeout_seconds: 2.0      # if first leg fills but second doesn't
+                                      # within this budget, market-sell the
+                                      # orphan to cap loss at the spread (live mode)
+  per_leg_timeout_seconds: 5.0        # max wait per leg before giving up
+
 # Position-monitor / exit logic. Each cycle, mark-to-market every open paper
 # trade; recommend EXIT when convergence threshold hit OR when annualized
 # return on early exit beats hold-to-resolution by required multiple. In dry

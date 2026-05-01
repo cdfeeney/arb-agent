@@ -17,6 +17,12 @@ from src.agent.resolver import resolve_pending
 from src.promotions.tracker import apply_active_promos
 from src.alerts.notifier import alert_terminal, alert_sms
 from src.db.store import Database
+from src.exec import (
+    LiveExecutor,
+    LogOnlyExecutor,
+    build_entry_plan,
+    init_orders_schema,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +51,20 @@ class PollingAgent:
             )
         self.exit_cfg = position_monitor.ExitConfig.from_dict(config.get("exit", {}))
 
+        exec_cfg = config.get("execution", {}) or {}
+        self.exec_mode = (exec_cfg.get("mode") or "log_only").lower()
+        if self.exec_mode == "live":
+            self.executor = LiveExecutor(
+                db_path=config["database"]["path"],
+                kalshi=self.kalshi,
+                poly=self.poly,
+                naked_leg_timeout_seconds=float(
+                    exec_cfg.get("naked_leg_timeout_seconds", 2.0),
+                ),
+            )
+        else:
+            self.executor = LogOnlyExecutor(db_path=config["database"]["path"])
+
     def _build_verifier(self) -> LLMVerifier | None:
         llm_cfg = self.cfg.get("llm", {})
         if not llm_cfg.get("enabled"):
@@ -61,8 +81,12 @@ class PollingAgent:
         )
 
     async def run(self):
+        await init_orders_schema(self.cfg["database"]["path"])
         mode = "DRY RUN" if self.cfg.get("dry_run") else "LIVE"
-        log.info("Arb agent started [%s] — polling every %ds", mode, self.cfg["polling"]["interval_seconds"])
+        log.info(
+            "Arb agent started [%s, executor=%s] — polling every %ds",
+            mode, self.exec_mode, self.cfg["polling"]["interval_seconds"],
+        )
         last_resolve = 0.0
         resolve_interval = float(self.cfg.get("polling", {}).get("resolve_interval_seconds", 3600))
         while True:
@@ -191,7 +215,7 @@ class PollingAgent:
             alloc_stats["skipped_capacity"], alloc_stats["skipped_diversification"],
         )
 
-        # Phase 3: alert + persist the chosen
+        # Phase 3: alert + persist the chosen + run executor
         alerted = 0
         for opp, sizing in chosen:
             dry = self.cfg.get("dry_run", True)
@@ -206,8 +230,36 @@ class PollingAgent:
             paper_id = await self.db.save_paper_trade(opp, sizing)
             log.info("Paper trade #%d recorded (pair=%s edge=%.2f%% predicted=$%.2f)",
                      paper_id, opp["pair_id"], opp["profit_pct"]*100, sizing["net_profit"])
-            if dry:
-                log.info("[DRY RUN] Would place orders — skipping execution")
+
+            plan = build_entry_plan(opp, sizing, paper_trade_id=paper_id)
+            log.info(
+                "Executor[%s] entry corr=%s pair=%s — "
+                "leg_yes %s/%s buy_yes %g@%.4f=$%.2f | "
+                "leg_no %s/%s buy_no %g@%.4f=$%.2f | "
+                "exp_cost=$%.2f exp_net=$%.2f payout=$%.2f",
+                self.executor.mode, plan.correlation_id, plan.pair_id[:60],
+                plan.leg_yes.platform, plan.leg_yes.ticker[:24],
+                plan.leg_yes.contracts, plan.leg_yes.price_limit,
+                plan.leg_yes.contracts * plan.leg_yes.price_limit,
+                plan.leg_no.platform, plan.leg_no.ticker[:24],
+                plan.leg_no.contracts, plan.leg_no.price_limit,
+                plan.leg_no.contracts * plan.leg_no.price_limit,
+                plan.expected_cost_usd, plan.expected_net_profit_usd,
+                plan.expected_payout_usd,
+            )
+            try:
+                result = await self.executor.execute_entry(plan)
+                if not result.success:
+                    log.warning(
+                        "Executor[%s] FAILED corr=%s err=%s",
+                        self.executor.mode, plan.correlation_id, result.error,
+                    )
+            except NotImplementedError as e:
+                log.error(
+                    "Executor[%s] refused: %s — paper_trade #%d recorded but "
+                    "no orders placed",
+                    self.executor.mode, e, paper_id,
+                )
             alerted += 1
 
         # NOTE: position_monitor used to run here at the end of each entry-side
