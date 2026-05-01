@@ -112,6 +112,17 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
             return None
 
         slug = raw.get("slug") or raw.get("id", "")
+        # For multi-outcome events (e.g. "which-artists-will-release-albums-2026"
+        # with Frank Ocean / Drake as sub-outcomes), the market's OWN slug does
+        # NOT resolve as a standalone URL on polymarket.com — only the parent
+        # event's slug does. Prefer events[0].slug when present, fall back to
+        # the market slug for true binary markets.
+        url_slug = slug
+        events = raw.get("events")
+        if isinstance(events, list) and events and isinstance(events[0], dict):
+            ev_slug = events[0].get("slug")
+            if ev_slug:
+                url_slug = ev_slug
         liq = float(raw.get("liquidity", 0) or 0)
         per_leg_depth = liq / 2 if liq > 0 else 0
         # Capture clobTokenIds so we can re-fetch live order-book prices via CLOB
@@ -138,7 +149,7 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
             "yes_token": clob_tokens[0] if clob_tokens and len(clob_tokens) >= 1 else None,
             "no_token":  clob_tokens[1] if clob_tokens and len(clob_tokens) >= 2 else None,
             "closes_at": _parse_dt(raw.get("endDate")),
-            "url": f"https://polymarket.com/event/{slug}",
+            "url": f"https://polymarket.com/event/{url_slug}",
         }
     except Exception as e:
         log.debug(f"normalize_polymarket failed: {e}")
