@@ -5,12 +5,10 @@ bot reads prices from clob.polymarket.com (offshore). If the user trades
 through the US-regulated app at api.polymarket.us, every "arb" we capture
 is fictional unless those two books quote the same prices.
 
-The script:
-  1. Pulls top N markets by volume from international Polymarket Gamma.
-  2. For each, fetches the order book from both:
-       - clob.polymarket.com (per-token-id YES/NO books)
-       - api.polymarket.us   (single book per slug)
-  3. Reports best-bid / best-ask on each side, and the diff.
+Strategy: pick markets from what US ACTUALLY HAS first, then look them up
+on intl by question text. Reverse direction is the only reliable one
+because US slugs differ from intl slugs and US carries a different
+catalog (different categories, different naming).
 
 Run from project root:
     py -3 -m scripts.diff_polymarket_us
@@ -37,39 +35,17 @@ from src.clients.polymarket_us import PolymarketUSClient  # noqa: E402
 from src.config import load_config  # noqa: E402
 
 
-# Polymarket US is CFTC-regulated; doesn't list state-regulated sports books.
-# Gamma's `category` field on individual markets is often empty/inconsistent,
-# so rely on question-text matching for sports keywords as the primary filter.
-SPORTS_KEYWORDS = (
-    "fifa", "world cup", "nba", "nba finals", "stanley cup", "nhl", "nfl",
-    "super bowl", "mlb", "world series", "ufc", "boxing", "tennis", "f1",
-    "formula 1", "premier league", "champions league", "uefa", "olympics",
-    "ncaa", "march madness", "wimbledon", "us open", "masters",
-    "heavyweight", "middleweight", "bantamweight", "flyweight",
-    "drivers' champion", "constructors' champion",
-    "wins the", "win the 20",  # "wins the 2026 X" / "win the 2026 Y" pattern
-)
-
-
-def _is_sports(market: dict) -> bool:
-    """Best-effort sports detection via category OR question text."""
-    cat = (market.get("category") or market.get("categorySlug") or "").lower()
-    if cat == "sports":
-        return True
-    q = (market.get("question") or "").lower()
-    return any(kw in q for kw in SPORTS_KEYWORDS)
-
-
-# Fallback slugs known to exist on Polymarket US (politics / IPO / crypto /
-# economics) — used if the Gamma top-by-volume path returns mostly sports
-# even after filtering. User can override with --slugs.
-FALLBACK_SLUGS = [
-    "will-openai-not-ipo-by-december-31-2026",
-    "will-bitcoin-reach-200000-by-december-31-2026",
-    "will-the-republican-party-control-the-house-after-the-2026-midterm-elections",
-    "another-us-debt-downgrade-before-2027",
-    "will-no-fed-rate-cuts-happen-in-2026",
-]
+def _norm_tokens(text: str) -> set[str]:
+    """Tokenize for question-text matching: lowercase, strip punctuation,
+    drop short common words. Used to score whether two questions describe
+    the same event."""
+    import re
+    if not text:
+        return set()
+    raw = re.sub(r"[^a-z0-9 ]+", " ", text.lower()).split()
+    stop = {"the", "a", "an", "is", "be", "by", "in", "on", "of", "to", "for",
+            "will", "or", "and", "with", "vs"}
+    return {t for t in raw if len(t) >= 3 and t not in stop}
 
 
 async def main() -> None:
@@ -89,211 +65,170 @@ async def main() -> None:
     poly_intl = PolymarketClient(rate_limit_per_min=120)
     poly_us = PolymarketUSClient(rate_limit_per_min=120)
 
-    # Sanity probe: dump what US actually has so we can see the slug format
-    # they use vs international. If 404s persist on slugs we know exist on
-    # intl, the slugs almost certainly differ between the two platforms.
-    print("\n=== US side market sample (top 10 by volume) ===\n")
-    us_sample = await poly_us.fetch_markets(limit=50, active=True, closed=False)
-    us_sample.sort(
-        key=lambda m: float(m.get("volumeNum", 0) or m.get("volume", 0) or 0),
-        reverse=True,
-    )
-    if not us_sample:
-        print("  (US returned NO markets at all — endpoint or auth issue)")
-    else:
-        print(f"  Found {len(us_sample)} active markets on US gateway. Top 10:")
-        for m in us_sample[:10]:
-            slug = m.get("slug") or "(no-slug)"
-            q = (m.get("question") or "")[:65]
-            print(f"    {slug:55s}  {q}")
-    print()
+    print(f"=== Polymarket US vs International Price Diff ===")
+    print(f"US client authenticated: {poly_us.authenticated}\n")
 
-    print(f"=== Polymarket US vs International Price Diff ===\n")
-    print(
-        f"US client authenticated: {poly_us.authenticated}  "
-        f"(read-only diff still works without creds)"
-    )
-    if not poly_us.authenticated:
-        # Diagnostic: did .env at least have the variables?
-        kid = os.environ.get("POLYMARKET_US_KEY_ID", "")
-        sec = os.environ.get("POLYMARKET_US_SECRET_KEY", "")
-        print(
-            f"  Diagnostic: POLYMARKET_US_KEY_ID set={bool(kid)} (len={len(kid)}), "
-            f"POLYMARKET_US_SECRET_KEY set={bool(sec)} (len={len(sec)})"
-        )
-        if not kid or not sec:
-            print(
-                "  -> .env not found or missing POLYMARKET_US_* keys. "
-                "Add them to /root/arb-agent/.env"
-            )
-    print()
-
-    slugs: list[str]
-    intl_markets: dict[str, dict] = {}
+    # Strategy: pick markets from US first (smaller catalog), then look them
+    # up on intl by question text. Reverse direction (start from intl) fails
+    # because US doesn't carry every intl category and slugs don't match.
+    us_picks: list[dict] = []
 
     if args.slugs:
-        slugs = [s.strip() for s in args.slugs.split(",") if s.strip()]
-        # Direct slug lookup via Gamma's slug filter param.
+        # Direct US slug lookup via /v1/markets?slug=
         import httpx
-        async with httpx.AsyncClient(timeout=30) as client:
-            for s in slugs:
-                try:
-                    resp = await client.get(
-                        "https://gamma-api.polymarket.com/markets",
-                        params={"slug": s, "limit": 1},
-                    )
-                    if resp.status_code == 200:
-                        batch = resp.json() or []
-                        if batch:
-                            intl_markets[s] = batch[0]
-                except Exception:
-                    pass
-    else:
-        candidates = await poly_intl.fetch_markets(
-            limit=300, max_markets=300,
-            max_days_to_close=400, min_volume=10000,
-        )
-        non_sports = [m for m in candidates if not _is_sports(m)]
-        non_sports.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
-        n_skipped = len(candidates) - len(non_sports)
-        if n_skipped:
-            print(
-                f"  Filtered out {n_skipped} sports markets (Polymarket US "
-                f"doesn't list sports).\n"
-            )
-        for m in non_sports[: args.limit]:
-            slug = m.get("slug")
-            if slug:
-                intl_markets[slug] = m
-
-        # If filtering still left us with mostly sports (e.g. Gamma is
-        # 100% sports right now), fall back to known politics/IPO/crypto
-        # slugs that should exist on US.
-        if len(intl_markets) < args.limit:
-            print(
-                f"  Only {len(intl_markets)} non-sports markets matched; "
-                f"using fallback slug list.\n"
-            )
-            import httpx
+        for s in [s.strip() for s in args.slugs.split(",") if s.strip()]:
             async with httpx.AsyncClient(timeout=30) as client:
-                for s in FALLBACK_SLUGS:
-                    if s in intl_markets:
-                        continue
-                    if len(intl_markets) >= args.limit:
-                        break
-                    try:
-                        resp = await client.get(
-                            "https://gamma-api.polymarket.com/markets",
-                            params={"slug": s, "limit": 1},
-                        )
-                        if resp.status_code == 200:
-                            batch = resp.json() or []
-                            if batch:
-                                intl_markets[s] = batch[0]
-                    except Exception:
-                        pass
-        slugs = list(intl_markets.keys())
+                resp = await client.get(
+                    f"{poly_us.PUBLIC_URL}/v1/markets",
+                    params={"slug": s, "limit": 1},
+                )
+            if resp.status_code == 200:
+                batch = (resp.json() or {}).get("markets") or []
+                if batch:
+                    us_picks.append(batch[0])
+                else:
+                    print(f"  US slug not found: {s}")
+            else:
+                print(f"  US lookup failed for {s}: {resp.status_code}")
+    else:
+        print(f"Pulling US active markets, sorting by volume…")
+        us_all = await poly_us.fetch_markets(limit=100, active=True, closed=False)
+        # Volume field: try volumeNum then volume
+        def _vol(m: dict) -> float:
+            v = m.get("volumeNum") or m.get("volume") or 0
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+        us_all.sort(key=_vol, reverse=True)
 
-    if not slugs:
-        print("No markets found.\n")
+        print(f"  US has {len(us_all)} active markets. Top 15 by volume:")
+        for m in us_all[:15]:
+            cat = m.get("category") or ""
+            print(
+                f"    [{cat:12s}] vol={_vol(m):>10,.0f}  "
+                f"{(m.get('slug') or '')[:50]:50s}  "
+                f"{(m.get('question') or '')[:55]}"
+            )
+        print()
+
+        # Pick top N. Don't filter by category — US has sports, crypto, politics.
+        # We want a mix to see if prices align across categories.
+        us_picks = us_all[: args.limit]
+
+    if not us_picks:
+        print("No US markets to compare.\n")
         return
 
-    print(f"Comparing {len(slugs)} markets:\n")
+    print(f"Comparing {len(us_picks)} markets (US-side first):\n")
     diffs: list[dict] = []
-    for slug in slugs:
-        intl = intl_markets.get(slug)
-        if not intl:
-            print(f"  {slug:50s} — not found on Gamma")
-            continue
+    for usm in us_picks:
+        us_slug = usm.get("slug") or ""
+        us_question = usm.get("question") or ""
+        us_category = usm.get("category") or ""
 
-        # International: use Gamma bestBid/bestAsk + CLOB top-of-book if tokens.
-        intl_yes_ask = float(intl.get("bestAsk", 0) or 0)
-        intl_yes_bid = float(intl.get("bestBid", 0) or 0)
-
-        # International CLOB if token ids present
-        intl_clob_yes_bid = intl_clob_yes_ask = None
-        clob_tokens = intl.get("clobTokenIds")
-        if isinstance(clob_tokens, str):
-            import json
-            try:
-                clob_tokens = json.loads(clob_tokens)
-            except Exception:
-                clob_tokens = None
-        if clob_tokens and len(clob_tokens) >= 1:
-            yes_book = await poly_intl.fetch_clob_book(clob_tokens[0])
-            if yes_book:
-                intl_clob_yes_ask, _ = poly_intl.best_ask_from_book(yes_book)
-                intl_clob_yes_bid, _ = poly_intl.best_bid_from_book(yes_book)
-
-        question = (intl.get("question") or "")
-        question_short = question[:70]
-
-        # US side: use search to find the matching slug — US slugs differ
-        # from intl slugs even for the same event. Fall back to direct slug
-        # lookup if search returns nothing.
-        us_slug = None
-        us_match_question = None
-        if question:
-            events = await poly_us.search(question, limit=3)
-            for ev in events:
-                for m in (ev.get("markets") or []):
-                    cand_slug = m.get("slug") or ""
-                    cand_q = m.get("question") or ev.get("title") or ""
-                    if cand_slug:
-                        us_slug = cand_slug
-                        us_match_question = cand_q
-                        break
-                if us_slug:
-                    break
-
-        # If search didn't resolve, try the original intl slug verbatim.
-        if not us_slug:
-            us_slug = slug
-
-        # Prefer BBO endpoint (lighter than full book); fall back to book.
+        # US prices: prefer BBO (light), fall back to /book.
         us_bbo = await poly_us.fetch_market_bbo(us_slug)
         us_yes_bid = us_yes_ask = None
-        us_book = None
         if us_bbo:
             bb = us_bbo.get("bestBid") or {}
             ba = us_bbo.get("bestAsk") or {}
             try:
                 us_yes_bid = float(bb.get("value", 0) or 0)
             except (TypeError, ValueError):
-                us_yes_bid = None
+                pass
             try:
                 us_yes_ask = float(ba.get("value", 0) or 0)
             except (TypeError, ValueError):
-                us_yes_ask = None
-        else:
-            us_book = await poly_us.fetch_market_book(us_slug)
-            if us_book:
-                us_yes_bid, _ = PolymarketUSClient.best_bid_from_book(us_book)
-                us_yes_ask, _ = PolymarketUSClient.best_ask_from_book(us_book)
+                pass
+        if us_yes_bid is None and us_yes_ask is None:
+            book = await poly_us.fetch_market_book(us_slug)
+            if book:
+                us_yes_bid, _ = PolymarketUSClient.best_bid_from_book(book)
+                us_yes_ask, _ = PolymarketUSClient.best_ask_from_book(book)
+        # Fallback to bestBid/bestAsk on the market record itself.
+        if us_yes_bid is None:
+            try:
+                us_yes_bid = float(usm.get("bestBid", 0) or 0)
+            except (TypeError, ValueError):
+                us_yes_bid = 0.0
+        if us_yes_ask is None:
+            try:
+                us_yes_ask = float(usm.get("bestAsk", 0) or 0)
+            except (TypeError, ValueError):
+                us_yes_ask = 0.0
 
-        print(f"  --- {slug} ---")
-        print(f"      Q: {question_short}")
-        if us_match_question and us_match_question != question:
-            print(f"      US Q: {us_match_question[:70]}  (slug={us_slug})")
-        elif us_slug != slug:
-            print(f"      US slug: {us_slug}")
-        print(f"      Intl (Gamma):     YES bid={intl_yes_bid:.4f}  ask={intl_yes_ask:.4f}")
-        if intl_clob_yes_bid is not None:
-            print(f"      Intl (CLOB live): YES bid={intl_clob_yes_bid:.4f}  ask={intl_clob_yes_ask:.4f}")
-        if us_yes_bid is not None or us_yes_ask is not None:
-            print(f"      US   (api.us):    YES bid={us_yes_bid or 0:.4f}  ask={us_yes_ask or 0:.4f}")
-            if intl_clob_yes_ask is not None and us_yes_ask:
-                ask_diff = us_yes_ask - intl_clob_yes_ask
-                print(f"      Δ ASK (US - intl-CLOB): {ask_diff:+.4f}")
-                diffs.append({
-                    "slug": slug,
-                    "us_slug": us_slug,
-                    "ask_diff": ask_diff,
-                    "intl_ask": intl_clob_yes_ask,
-                    "us_ask": us_yes_ask,
-                })
+        # Find matching intl market by question text via Gamma full-text search.
+        # Then validate the match by token overlap so a junk hit doesn't
+        # silently distort the diff.
+        intl: dict | None = None
+        intl_match_question = None
+        if us_question:
+            import httpx
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(
+                        "https://gamma-api.polymarket.com/markets",
+                        params={"q": us_question, "limit": 5, "active": "true"},
+                    )
+                if resp.status_code == 200:
+                    candidates = resp.json() or []
+                    us_tokens = _norm_tokens(us_question)
+                    best_overlap = 0
+                    for c in candidates:
+                        c_q = c.get("question") or ""
+                        overlap = len(us_tokens & _norm_tokens(c_q))
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            intl = c
+                            intl_match_question = c_q
+                    # Reject low-similarity matches (need >=3 shared substantive tokens).
+                    if best_overlap < 3:
+                        intl = None
+                        intl_match_question = None
+            except Exception as e:
+                print(f"  intl search error: {e}")
+
+        intl_clob_yes_bid = intl_clob_yes_ask = None
+        intl_yes_bid = intl_yes_ask = 0.0
+        if intl:
+            try:
+                intl_yes_ask = float(intl.get("bestAsk", 0) or 0)
+                intl_yes_bid = float(intl.get("bestBid", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+            clob_tokens = intl.get("clobTokenIds")
+            if isinstance(clob_tokens, str):
+                import json
+                try:
+                    clob_tokens = json.loads(clob_tokens)
+                except Exception:
+                    clob_tokens = None
+            if clob_tokens:
+                yes_book = await poly_intl.fetch_clob_book(clob_tokens[0])
+                if yes_book:
+                    intl_clob_yes_ask, _ = poly_intl.best_ask_from_book(yes_book)
+                    intl_clob_yes_bid, _ = poly_intl.best_bid_from_book(yes_book)
+
+        print(f"  --- {us_slug} ---")
+        print(f"      US   Q: [{us_category}] {us_question[:70]}")
+        if intl:
+            print(f"      Intl Q: {(intl_match_question or '')[:70]}")
+            print(f"      Intl (Gamma):     YES bid={intl_yes_bid:.4f}  ask={intl_yes_ask:.4f}")
+            if intl_clob_yes_bid is not None:
+                print(f"      Intl (CLOB live): YES bid={intl_clob_yes_bid:.4f}  ask={intl_clob_yes_ask:.4f}")
         else:
-            print(f"      US   (api.us):    NO MATCH (search returned nothing, slug 404)")
+            print(f"      Intl Q: NOT FOUND (no intl market with sufficient question overlap)")
+        print(f"      US   (api.us):    YES bid={us_yes_bid or 0:.4f}  ask={us_yes_ask or 0:.4f}")
+        if intl_clob_yes_ask is not None and us_yes_ask:
+            ask_diff = us_yes_ask - intl_clob_yes_ask
+            print(f"      Δ ASK (US - intl-CLOB): {ask_diff:+.4f}")
+            diffs.append({
+                "us_slug": us_slug,
+                "ask_diff": ask_diff,
+                "intl_ask": intl_clob_yes_ask,
+                "us_ask": us_yes_ask,
+            })
         print()
 
     if diffs:
