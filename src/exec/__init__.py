@@ -27,16 +27,26 @@ from .base import (
     make_idempotency_key,
 )
 from .atomic_entry import build_entry_plan
+from .atomic_orchestrator import execute_atomic_entry
+from .exchange import Exchange, FillState, MarketSellResult, PlaceResult
 from .log_only_executor import LogOnlyExecutor
 from .live_executor import LiveExecutor
 from .order_state import init_orders_schema
+from .simulated_exchange import SimSpec, SimulatedExchange
 
 __all__ = [
     "EntryPlan",
     "EntryResult",
     "LegResult",
     "OrderPlan",
+    "Exchange",
+    "FillState",
+    "MarketSellResult",
+    "PlaceResult",
+    "SimSpec",
+    "SimulatedExchange",
     "build_entry_plan",
+    "execute_atomic_entry",
     "init_orders_schema",
     "LogOnlyExecutor",
     "LiveExecutor",

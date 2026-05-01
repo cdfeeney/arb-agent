@@ -1,26 +1,23 @@
-"""Live executor — STUBBED for Sprint 1.
+"""Live executor — wraps the orchestrator with real exchange registry.
 
-Sprint 2 will wire:
-  * src/exec/polymarket_writer.py — Ed25519-signed CLOB POST /order with
-    integer-contract sizing and order_type=GTC for makers / FOK for takers.
-  * src/exec/kalshi_writer.py     — RSA-signed POST /trade-api/v2/portfolio
-    /orders with action=buy, side=yes|no, type=limit, time_in_force=IOC.
-  * Atomic two-leg orchestration: place both legs concurrently, watch for
-    fills with a budget of `naked_leg_timeout_seconds`. If one leg fills and
-    the other doesn't within the budget, market-sell the orphan back into
-    its top bid (cap loss at the spread) and mark the entry FAILED.
-  * Idempotency: same idempotency_key passed to both APIs as
-    client_order_id, so retries don't double-fire.
+Sprint 2a (this file ships): orchestration is fully wired. Two-leg atomic
+entry with naked-leg defense runs end-to-end against any Exchange impl.
+The simulated exchange (src/exec/simulated_exchange.py) is used in tests
+to prove the decision tree.
 
-Until Sprint 2: refuses to place orders. Set execution.mode: log_only in
-config.yaml. The bot will continue paper-trading via LogOnlyExecutor.
+Sprint 2b (still pending — needs API keys to verify): real Exchange
+implementations for Polymarket and Kalshi. Until those land, constructing
+LiveExecutor without a non-empty `exchanges` map raises NotImplementedError
+at construction time so the bot won't even start in live mode.
 """
 
 from __future__ import annotations
 
 import logging
 
+from .atomic_orchestrator import execute_atomic_entry
 from .base import EntryPlan, EntryResult
+from .exchange import Exchange
 
 log = logging.getLogger(__name__)
 
@@ -31,24 +28,37 @@ class LiveExecutor:
     def __init__(
         self,
         db_path: str,
-        kalshi,
-        poly,
+        kalshi=None,
+        poly=None,
         naked_leg_timeout_seconds: float = 2.0,
+        per_leg_timeout_seconds: float = 5.0,
+        exchanges: dict[str, Exchange] | None = None,
     ):
         self.db_path = db_path
         self.kalshi = kalshi
         self.poly = poly
         self.naked_leg_timeout_seconds = naked_leg_timeout_seconds
+        self.per_leg_timeout_seconds = per_leg_timeout_seconds
+
+        if exchanges:
+            self.exchanges = exchanges
+        else:
+            # Sprint 2b will populate this from kalshi/poly clients. Until
+            # then, refuse to construct so the bot crashes loudly at startup
+            # rather than silently dropping orders later.
+            raise NotImplementedError(
+                "LiveExecutor: no real Exchange implementations registered. "
+                "Sprint 2b will wire PolymarketExchange (Ed25519 signing) and "
+                "KalshiExchange (RSA signing). Until then, set "
+                "execution.mode: log_only in config.yaml."
+            )
 
     async def execute_entry(self, plan: EntryPlan) -> EntryResult:
-        log.error(
-            "LiveExecutor.execute_entry not yet implemented — refusing to place "
-            "real orders. Use execution.mode: log_only in config.yaml until "
-            "Sprint 2 lands. Dropped plan: corr=%s pair=%s",
-            plan.correlation_id,
-            plan.pair_id,
-        )
-        raise NotImplementedError(
-            "LiveExecutor: real order placement not implemented in Sprint 1. "
-            "Set execution.mode: log_only in config.yaml."
+        return await execute_atomic_entry(
+            plan=plan,
+            exchanges=self.exchanges,
+            db_path=self.db_path,
+            naked_leg_timeout_seconds=self.naked_leg_timeout_seconds,
+            per_leg_timeout_seconds=self.per_leg_timeout_seconds,
+            execution_mode=self.mode,
         )
