@@ -29,24 +29,46 @@ from src.config import load_config
 
 async def probe(kalshi: KalshiClient, ticker: str, our_recorded_bid: float | None):
     print(f"  ticker={ticker}")
+
+    # Hit the raw HTTP endpoint ourselves so we can see what Kalshi actually
+    # returns — fetch_orderbook silently swallows non-200 and shape mismatches.
+    import httpx, time
+    path = f"/trade-api/v2/markets/{ticker}/orderbook"
+    url = f"{kalshi.BASE_URL}/markets/{ticker}/orderbook"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=kalshi._auth_headers("GET", path))
+    print(f"    raw HTTP {resp.status_code}")
+    if resp.status_code != 200:
+        print(f"    body (first 500 chars): {resp.text[:500]}")
+        return
+    raw = resp.json()
+    print(f"    response keys: {sorted(raw.keys())}")
+    ob = raw.get("orderbook", {})
+    print(f"    orderbook keys: {sorted(ob.keys()) if isinstance(ob, dict) else type(ob).__name__}")
+    if isinstance(ob, dict):
+        for k in sorted(ob.keys()):
+            v = ob[k]
+            if isinstance(v, list):
+                print(f"      orderbook[{k!r}]: {len(v)} entries", end="")
+                if v:
+                    print(f"  sample first: {v[0]}")
+                else:
+                    print()
+            else:
+                print(f"      orderbook[{k!r}]: {v!r}")
+
+    # Now run through our parser
     book = await kalshi.fetch_orderbook(ticker)
     if not book:
-        print("    fetch_orderbook returned None (HTTP non-200 or exception)")
+        print("    parser returned None")
         return
     yes_bids = book.get("yes_bids", [])
-    yes_asks = book.get("yes_asks", [])
     no_bids = book.get("no_bids", [])
-    no_asks = book.get("no_asks", [])
-    print(f"    yes_bids={len(yes_bids)}  yes_asks={len(yes_asks)}  "
-          f"no_bids={len(no_bids)}  no_asks={len(no_asks)}")
+    print(f"    parser sees: yes_bids={len(yes_bids)}  no_bids={len(no_bids)}")
     if yes_bids:
-        print("    top 3 YES bids:")
-        for p, s in yes_bids[:3]:
-            print(f"      price={p:.4f}  size={s}")
+        print(f"      top YES bid: price={yes_bids[0][0]:.4f}  size={yes_bids[0][1]}")
     if no_bids:
-        print("    top 3 NO bids:")
-        for p, s in no_bids[:3]:
-            print(f"      price={p:.4f}  size={s}")
+        print(f"      top NO  bid: price={no_bids[0][0]:.4f}  size={no_bids[0][1]}")
     if our_recorded_bid is not None:
         print(f"    bot recorded: {our_recorded_bid:.4f}")
 
