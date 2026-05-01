@@ -90,16 +90,19 @@ async def main():
 
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
+        # Latest mark per trade via correlated subquery — INNER JOIN dedups
+        # (the prior LEFT JOIN bug made each trade appear once per saved mark).
         cur = await db.execute(
             f"""SELECT pt.id, pt.pair_id, pt.yes_platform, pt.yes_ticker, pt.yes_token,
                        pt.no_platform, pt.no_ticker, pt.no_token,
                        pt.yes_url, pt.no_url,
                        m.yes_bid_now, m.no_bid_now, m.observed_at
                 FROM paper_trades pt
-                LEFT JOIN paper_trade_marks m ON pt.id = m.paper_trade_id
-                LEFT JOIN (SELECT paper_trade_id, MAX(observed_at) latest
-                           FROM paper_trade_marks GROUP BY paper_trade_id) lm
-                  ON m.paper_trade_id=lm.paper_trade_id AND m.observed_at=lm.latest
+                LEFT JOIN paper_trade_marks m ON m.id = (
+                    SELECT id FROM paper_trade_marks
+                    WHERE paper_trade_id = pt.id
+                    ORDER BY observed_at DESC LIMIT 1
+                )
                 {where}
                 ORDER BY pt.detected_at DESC LIMIT ?""",
             (*params, args.limit),
