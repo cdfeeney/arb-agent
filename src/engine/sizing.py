@@ -121,8 +121,23 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
         )
         return _reject_sizing(opportunity, "below_min_bet")
 
-    # Translate total stake to contracts, then split into legs
-    n_contracts = total_stake / cost_per_contract
+    # Translate total stake to contracts, then split into legs.
+    # CRITICAL: round DOWN to whole contracts because Kalshi (and Polymarket
+    # in live mode) only trades integer contracts. Predicted P&L must match
+    # what live execution will actually realize, otherwise paper-mode
+    # systematically overstates profit by ~7% (the fractional remainder).
+    n_contracts_raw = total_stake / cost_per_contract
+    import math
+    n_contracts = float(math.floor(n_contracts_raw))
+    if n_contracts < 1:
+        log.info(
+            "size_position rejected: total_stake $%.2f / cpc $%.4f = %.3f contracts "
+            "(<1 whole contract)", total_stake, cost_per_contract, n_contracts_raw,
+        )
+        return _reject_sizing(opportunity, "below_one_contract")
+    # Recompute total_stake from integer contracts so all downstream math
+    # reflects the actual amount committed.
+    total_stake = n_contracts * cost_per_contract
     yes_leg_usd = round(n_contracts * yes_price, 2)
     no_leg_usd = round(n_contracts * no_price, 2)
     guaranteed_payout = round(n_contracts, 2)

@@ -88,9 +88,11 @@ sizing:
                                # Bumped from 5% so we can actually deploy capital — at 5%
                                # ($5 stake) Kalshi+Polymarket fees (~0.28) eat 5.6% of stake
                                # which kills sub-5% arbs. $10 stakes get fees down to ~2.75%.
-  min_bet: 1                   # platform-side floor. Polymarket has no min; Kalshi ~$1
-                               # minimum order. We use $1 so Kelly-computed stakes (typically
-                               # $1–$11 on $100 bankroll at full Kelly) aren't reject-and-skipped.
+  min_bet: 0.5                 # platform-side floor. With $100 bankroll and typical
+                               # cost_per_contract ~$0.94, $0.50 lets us enter positions of
+                               # 1 contract on Kalshi minimum + 1 on Polymarket — the natural
+                               # "minimum unit of arbitrage" — without padding to $1. Reduces
+                               # fee drag-as-fraction of stake; capture more diverse positions.
   max_bet: 10                  # hard ceiling at 10% of $100 bankroll. Single arb can't
                                # blow through more than this.
   kelly_fraction: 1.0          # full Kelly. Rationale: cross-platform arbs are near-deterministic
