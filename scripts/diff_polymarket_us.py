@@ -91,121 +91,136 @@ async def main() -> None:
             else:
                 print(f"  US lookup failed for {s}: {resp.status_code}")
     else:
-        print(f"Pulling US active markets…")
-        us_all = await poly_us.fetch_markets(limit=200, active=True, closed=False)
+        # Pull recently-paper-traded intl Polymarket slugs from the bot's own
+        # DB. These are the markets we ACTUALLY care about — "are the prices
+        # we paper-traded against the prices a US account would pay?". Way
+        # more useful than picking random markets from US's 1144-market list
+        # (which has no volume field, defaulting to NBA MVP candidate clutter).
+        import aiosqlite
+        import re
 
-        # US uses different volume/activity field names than intl. Try a list
-        # of plausible names and use the first non-zero one. The previous
-        # `volumeNum` was 0 across all 1144 markets, so the sort was random.
-        VOLUME_FIELDS = (
-            "volumeNum", "volume", "volume24Hr", "volume24hr", "volume24h",
-            "totalVolume", "openInterest", "liquidity", "liquidityNum",
-            "tradeCount", "lastPriceSampleVolume",
-        )
-
-        def _activity_score(m: dict) -> float:
-            for f in VOLUME_FIELDS:
-                v = m.get(f)
-                if v is None:
-                    continue
-                try:
-                    n = float(v)
-                except (TypeError, ValueError):
-                    continue
-                if n > 0:
-                    return n
-            return 0.0
-
-        us_all.sort(key=_activity_score, reverse=True)
-
-        # Diagnostic: which field is actually populated on the first market?
-        if us_all:
-            sample = us_all[0]
-            populated = {k: sample.get(k) for k in VOLUME_FIELDS if sample.get(k)}
-            print(
-                f"  Diagnostic — activity fields populated on top market: "
-                f"{populated or '(NONE — all zero/missing)'}"
+        db_path = cfg["database"]["path"]
+        intl_slugs_in_play: list[tuple[str, str]] = []  # (slug, question)
+        async with aiosqlite.connect(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            # Pull most-recent unique polymarket.com slugs from recent paper trades.
+            cur = await db.execute(
+                """SELECT yes_url, no_url, yes_question, no_question,
+                          detected_at
+                   FROM paper_trades
+                   ORDER BY detected_at DESC
+                   LIMIT 200""",
             )
-            print(
-                f"  All non-empty top-level field names on first US market: "
-                f"{sorted(k for k, v in sample.items() if v not in (None, '', 0, [], {}))}"
-            )
+            seen: set[str] = set()
+            slug_re = re.compile(r"polymarket\.com/event/([a-z0-9\-]+)")
+            for r in await cur.fetchall():
+                for url, q in [
+                    (r["yes_url"] or "", r["yes_question"] or ""),
+                    (r["no_url"] or "", r["no_question"] or ""),
+                ]:
+                    m = slug_re.search(url)
+                    if not m:
+                        continue
+                    slug = m.group(1)
+                    if slug in seen:
+                        continue
+                    seen.add(slug)
+                    intl_slugs_in_play.append((slug, q))
+                    if len(intl_slugs_in_play) >= args.limit * 4:
+                        break
+                if len(intl_slugs_in_play) >= args.limit * 4:
+                    break
 
-        print(f"\n  US has {len(us_all)} active markets. Top 15 by activity:")
-        for m in us_all[:15]:
-            cat = m.get("category") or ""
+        if not intl_slugs_in_play:
             print(
-                f"    [{cat:12s}] act={_activity_score(m):>12,.2f}  "
-                f"{(m.get('slug') or '')[:50]:50s}  "
-                f"{(m.get('question') or '')[:55]}"
+                "  No polymarket.com slugs found in paper_trades. "
+                "Falling back to US-side market scan.\n"
             )
-        print()
-
-        # Skip "future-event" markets with zero activity — they will all
-        # have flat 50¢ prices and dominate the list when nothing has
-        # actual volume yet.
-        active_only = [m for m in us_all if _activity_score(m) > 0]
-        if active_only:
-            us_picks = active_only[: args.limit]
+            us_all = await poly_us.fetch_markets(limit=50, active=True, closed=False)
+            us_picks = us_all[: args.limit]
         else:
             print(
-                "  WARNING: no US market has any populated activity field — "
-                "falling back to first N regardless.\n"
+                f"Found {len(intl_slugs_in_play)} unique intl slugs from "
+                f"recent paper_trades. Looking each up on US…\n"
             )
-            us_picks = us_all[: args.limit]
+            for intl_slug, intl_question in intl_slugs_in_play:
+                if len(us_picks) >= args.limit:
+                    break
+                # Search US for this question.
+                us_match = None
+                events = await poly_us.search(intl_question or intl_slug, limit=5)
+                intl_t = _norm_tokens(intl_question)
+                best_overlap = 0
+                for ev in events:
+                    for cand in (ev.get("markets") or []):
+                        cand_q = cand.get("question") or ev.get("title") or ""
+                        cand_t = _norm_tokens(cand_q)
+                        if not cand_t:
+                            continue
+                        overlap = len(intl_t & cand_t)
+                        needed = max(2, (min(len(intl_t), len(cand_t)) + 1) // 2)
+                        if overlap >= needed and overlap > best_overlap:
+                            best_overlap = overlap
+                            us_match = cand
+                if us_match:
+                    us_match["_intl_slug"] = intl_slug
+                    us_match["_intl_question"] = intl_question
+                    us_picks.append(us_match)
+                    print(
+                        f"  ✓ matched: {intl_slug[:50]} → "
+                        f"US slug={us_match.get('slug', '?')[:50]}"
+                    )
+                else:
+                    print(f"  ✗ no US match: {intl_slug[:60]}  ({intl_question[:50]})")
 
     if not us_picks:
         print("No US markets to compare.\n")
         return
 
-    print(f"Comparing {len(us_picks)} markets (US-side first):\n")
+    print(f"\nComparing {len(us_picks)} markets:\n")
     diffs: list[dict] = []
     for usm in us_picks:
         us_slug = usm.get("slug") or ""
-        us_question = usm.get("question") or ""
+        us_question = usm.get("question") or usm.get("title") or ""
         us_category = usm.get("category") or ""
 
-        # US prices: prefer BBO (light), fall back to /book.
+        # US prices: prefer live BBO (handles bestBid/bestAsk wrapper),
+        # fall back to /book, then to fields on the market list record
+        # (bestBidQuote/bestAskQuote — different field names than BBO uses).
         us_bbo = await poly_us.fetch_market_bbo(us_slug)
-        us_yes_bid = us_yes_ask = None
-        if us_bbo:
-            bb = us_bbo.get("bestBid") or {}
-            ba = us_bbo.get("bestAsk") or {}
-            try:
-                us_yes_bid = float(bb.get("value", 0) or 0)
-            except (TypeError, ValueError):
-                pass
-            try:
-                us_yes_ask = float(ba.get("value", 0) or 0)
-            except (TypeError, ValueError):
-                pass
-        if us_yes_bid is None and us_yes_ask is None:
+        us_yes_bid, us_yes_ask = PolymarketUSClient.extract_bid_ask(us_bbo or {})
+        if us_yes_bid == 0 and us_yes_ask == 0:
             book = await poly_us.fetch_market_book(us_slug)
             if book:
                 us_yes_bid, _ = PolymarketUSClient.best_bid_from_book(book)
                 us_yes_ask, _ = PolymarketUSClient.best_ask_from_book(book)
-        # Fallback to bestBid/bestAsk on the market record itself.
-        if us_yes_bid is None:
-            try:
-                us_yes_bid = float(usm.get("bestBid", 0) or 0)
-            except (TypeError, ValueError):
-                us_yes_bid = 0.0
-        if us_yes_ask is None:
-            try:
-                us_yes_ask = float(usm.get("bestAsk", 0) or 0)
-            except (TypeError, ValueError):
-                us_yes_ask = 0.0
+        if us_yes_bid == 0 and us_yes_ask == 0:
+            us_yes_bid, us_yes_ask = PolymarketUSClient.extract_bid_ask(usm)
 
-        # Find matching intl market by question text via Gamma full-text search.
-        # Then validate the match by token overlap so a junk hit doesn't
-        # silently distort the diff. Use a *ratio* rule rather than an
-        # absolute count so short questions ("NBA MVP" = 2 tokens) can match
-        # while still rejecting unrelated long-question pairings (Hungary PM
-        # vs FlyQuest LoL = 0 overlap).
+        # Find matching intl market. If we carried _intl_slug from the
+        # paper_trades-pivot path, look it up directly on Gamma — that's
+        # exact, no fuzzy matching needed. Otherwise (--slugs mode or US-
+        # first fallback), search Gamma by US question text and validate
+        # token overlap.
         intl: dict | None = None
         intl_match_question = None
-        if us_question:
-            import httpx
+        carried_intl_slug = usm.get("_intl_slug")
+        import httpx
+        if carried_intl_slug:
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.get(
+                        "https://gamma-api.polymarket.com/markets",
+                        params={"slug": carried_intl_slug, "limit": 1},
+                    )
+                if resp.status_code == 200:
+                    batch = resp.json() or []
+                    if batch:
+                        intl = batch[0]
+                        intl_match_question = intl.get("question") or ""
+            except Exception as e:
+                print(f"  intl Gamma slug lookup error: {e}")
+        elif us_question:
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
                     resp = await client.get(
@@ -228,10 +243,6 @@ async def main() -> None:
                             best_min_len = min(len(us_tokens), len(c_tokens))
                             intl = c
                             intl_match_question = c_q
-                    # Match rule: at least 2 shared tokens AND those tokens
-                    # cover ≥50% of the SHORTER question. This passes
-                    # "NBA MVP"↔"NBA MVP" (2/2=100%) and rejects
-                    # "Bitcoin $150k"↔"Bitcoin $200k" (1 shared, 1/3=33%).
                     needed = max(2, (best_min_len + 1) // 2)
                     if best_overlap < needed:
                         intl = None

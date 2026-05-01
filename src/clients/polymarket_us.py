@@ -234,6 +234,34 @@ class PolymarketUSClient:
             return None
 
     @staticmethod
+    def extract_bid_ask(market_or_bbo: dict) -> tuple[float, float]:
+        """Pull (bid, ask) from either a /v1/markets list record OR a
+        /v1/markets/{slug}/bbo response. US returns different field names
+        in different places — bbo uses bestBid/bestAsk wrapped in
+        {value, currency}, while the markets list uses bestBidQuote/
+        bestAskQuote with the same wrapper. Returns (0.0, 0.0) if neither
+        is present."""
+        if not market_or_bbo:
+            return 0.0, 0.0
+
+        def _val(field: str) -> float:
+            obj = market_or_bbo.get(field)
+            if obj is None:
+                return 0.0
+            if isinstance(obj, dict):
+                v = obj.get("value")
+            else:
+                v = obj
+            try:
+                return float(v) if v is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        bid = _val("bestBid") or _val("bestBidQuote")
+        ask = _val("bestAsk") or _val("bestAskQuote")
+        return bid, ask
+
+    @staticmethod
     def _parse_book(data: dict) -> dict:
         md = data.get("marketData") or data
         bids = sorted(
