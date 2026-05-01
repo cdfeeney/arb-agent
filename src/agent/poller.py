@@ -21,6 +21,7 @@ from src.exec import (
     LiveExecutor,
     LogOnlyExecutor,
     build_entry_plan,
+    build_exchange_registry,
     init_orders_schema,
 )
 
@@ -53,7 +54,9 @@ class PollingAgent:
 
         exec_cfg = config.get("execution", {}) or {}
         self.exec_mode = (exec_cfg.get("mode") or "log_only").lower()
+        self.allow_send = bool(exec_cfg.get("allow_send", False))
         if self.exec_mode == "live":
+            exchanges = build_exchange_registry(config, self.kalshi, self.poly)
             self.executor = LiveExecutor(
                 db_path=config["database"]["path"],
                 kalshi=self.kalshi,
@@ -61,6 +64,10 @@ class PollingAgent:
                 naked_leg_timeout_seconds=float(
                     exec_cfg.get("naked_leg_timeout_seconds", 2.0),
                 ),
+                per_leg_timeout_seconds=float(
+                    exec_cfg.get("per_leg_timeout_seconds", 5.0),
+                ),
+                exchanges=exchanges,
             )
         else:
             self.executor = LogOnlyExecutor(db_path=config["database"]["path"])
@@ -84,8 +91,9 @@ class PollingAgent:
         await init_orders_schema(self.cfg["database"]["path"])
         mode = "DRY RUN" if self.cfg.get("dry_run") else "LIVE"
         log.info(
-            "Arb agent started [%s, executor=%s] — polling every %ds",
-            mode, self.exec_mode, self.cfg["polling"]["interval_seconds"],
+            "Arb agent started [%s, executor=%s, allow_send=%s] — polling every %ds",
+            mode, self.exec_mode, self.allow_send,
+            self.cfg["polling"]["interval_seconds"],
         )
         last_resolve = 0.0
         resolve_interval = float(self.cfg.get("polling", {}).get("resolve_interval_seconds", 3600))

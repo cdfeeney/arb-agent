@@ -10,3 +10,8 @@ twilio>=9.0.0
 cryptography>=42.0.0
 anthropic>=0.40.0
 websockets>=12.0
+# Polymarket CLOB order placement (signing, nonce mgmt, L2 API creds).
+# Required only when execution.mode=live AND the bot places Polymarket-side
+# legs. Lazy-imported in src/exec/polymarket_exchange.py so the bot loads
+# without it.
+py-clob-client>=0.20.0

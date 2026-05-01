@@ -32,6 +32,7 @@ from .exchange import Exchange, FillState, MarketSellResult, PlaceResult
 from .log_only_executor import LogOnlyExecutor
 from .live_executor import LiveExecutor
 from .order_state import init_orders_schema
+from .registry import build_exchange_registry
 from .simulated_exchange import SimSpec, SimulatedExchange
 
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     "SimSpec",
     "SimulatedExchange",
     "build_entry_plan",
+    "build_exchange_registry",
     "execute_atomic_entry",
     "init_orders_schema",
     "LogOnlyExecutor",

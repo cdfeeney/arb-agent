@@ -138,11 +138,19 @@ database:
 #              (raises NotImplementedError). Sprint 2 implements signing +
 #              two-leg orchestration with naked-leg defense.
 execution:
-  mode: log_only
-  naked_leg_timeout_seconds: 2.0      # if first leg fills but second doesn't
-                                      # within this budget, market-sell the
-                                      # orphan to cap loss at the spread (live mode)
-  per_leg_timeout_seconds: 5.0        # max wait per leg before giving up
+  mode: log_only                      # log_only | live
+                                      #   log_only — fake fills, no exchange touched
+                                      #   live     — real exchange writers, but see allow_send
+  allow_send: false                   # FINAL kill switch. Even in live mode, when
+                                      # false: writers construct + sign + log the
+                                      # full request, then short-circuit the actual
+                                      # POST and return a fake fill. This is the
+                                      # dress-rehearsal mode — verifies auth, signing,
+                                      # and request shape work end-to-end without
+                                      # spending a cent. Flip to true to actually trade.
+  naked_leg_timeout_seconds: 2.0      # one-leg-filled grace before we cancel
+                                      # laggard + market-sell the filled leg
+  per_leg_timeout_seconds: 5.0        # total wait before giving up on both legs
 
 # Position-monitor / exit logic. Each cycle, mark-to-market every open paper
 # trade; recommend EXIT when convergence threshold hit OR when annualized
