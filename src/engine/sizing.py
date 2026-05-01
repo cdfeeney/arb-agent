@@ -98,6 +98,23 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
         )
         return _reject_sizing(opportunity, "missing_bid_depth")
 
+    # Tier-1 profit-ideas backlog #2: reject thin sub-outcome arbs at entry.
+    # Multi-outcome event UIs inflate "liquidity" at the parent-event level —
+    # a sub-outcome can show $5 of bid depth even when the parent event shows
+    # $5000. We already cap by `book_depth_fraction × bid_depth`, but a $5
+    # bid book × 25% × min_bet floor still produces a position we can't
+    # actually unwind cleanly. Hard floor: reject any arb where either leg's
+    # bid depth is below `min_bid_depth_usd` (default $20).
+    min_bid_depth = float(cfg.get("min_bid_depth_usd", 20))
+    if yes_bid_depth < min_bid_depth or no_bid_depth < min_bid_depth:
+        log.info(
+            "size_position rejected: thin bid book "
+            "(yes_dep=$%.2f no_dep=$%.2f, floor=$%.2f) — sub-outcome "
+            "liquidity won't support clean unwind",
+            yes_bid_depth, no_bid_depth, min_bid_depth,
+        )
+        return _reject_sizing(opportunity, "thin_bid_depth")
+
     max_yes_unwind_usd = yes_bid_depth * depth_fraction
     max_no_unwind_usd = no_bid_depth * depth_fraction
     max_contracts_yes_depth = max_yes_unwind_usd / yes_bid

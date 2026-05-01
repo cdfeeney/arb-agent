@@ -106,6 +106,13 @@ sizing:
                                # exited at top-of-book. With 0.25, a market with $40 of
                                # bid depth → $10 entry per leg. The user's "$10 → $1 is
                                # fine" principle: small in shallow books, larger in deep.
+  min_bid_depth_usd: 20        # tier-1 profit-idea #2: reject thin sub-outcome arbs at
+                               # entry. Multi-outcome event UIs report parent-event
+                               # liquidity ($5k+) but a sub-outcome can have $5 of real
+                               # bid depth. With a $20 floor, the smallest entry our
+                               # 0.25 book_depth_fraction would allow is $5/leg ($10
+                               # total) — fits the $10 max_bet cleanly. Trades below
+                               # this floor are inherently unexitable on $100 bankroll.
 
 fees:
   # Both platforms charge ONLY the taker (the side hitting a resting order).
