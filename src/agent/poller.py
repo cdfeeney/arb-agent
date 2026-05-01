@@ -6,6 +6,7 @@ from src.clients.kalshi import KalshiClient
 from src.clients.polymarket import PolymarketClient
 from src.clients.btc_feed import BTCFeed
 from src.engine.normalizer import normalize_kalshi, normalize_polymarket
+from src.agent.allocator import allocate, compute_free_capital
 from src.engine.matcher import match_markets, filter_binary_kalshi
 from src.engine.arb_detector import detect_arb
 from src.engine.sizing import size_position
@@ -159,7 +160,8 @@ class PollingAgent:
 
         opportunities = apply_active_promos(raw_opps, self.cfg["promotions"]["active"])
 
-        alerted = 0
+        # Phase 1: eligibility — dedup, cooldown, sizing min_bet
+        eligible: list[tuple[dict, dict]] = []
         cooldown_minutes = self.exit_cfg.cooldown_minutes
         for opp in opportunities:
             if await self.db.seen_recently(opp["pair_id"], self.cfg["alerts"]["dedup_window_minutes"]):
@@ -173,6 +175,25 @@ class PollingAgent:
             sizing = size_position(opp, {**self.cfg["sizing"], "fees": self.cfg.get("fees", {})})
             if sizing["bet_size"] < self.cfg["sizing"]["min_bet"]:
                 continue
+            eligible.append((opp, sizing))
+
+        # Phase 2: capacity gate — pick the highest-EV subset that fits the
+        # remaining bankroll. Without this we "deploy" more capital on paper
+        # than we have, and the predicted P&L is fictional.
+        bankroll = float(self.cfg["sizing"].get("bankroll", 100.0))
+        free_capital = await compute_free_capital(self.db, bankroll)
+        chosen, alloc_stats = allocate(eligible, free_capital, bankroll=bankroll)
+        log.info(
+            "Allocator: %d eligible, $%.2f free of $%.2f bankroll → picked %d, "
+            "deployed $%.2f, skipped capacity=%d diversification=%d",
+            alloc_stats["candidates"], alloc_stats["free_capital_start"], bankroll,
+            alloc_stats["chosen"], alloc_stats["deployed_this_cycle"],
+            alloc_stats["skipped_capacity"], alloc_stats["skipped_diversification"],
+        )
+
+        # Phase 3: alert + persist the chosen
+        alerted = 0
+        for opp, sizing in chosen:
             dry = self.cfg.get("dry_run", True)
             alert_terminal(opp, sizing, dry_run=dry)
             await alert_sms(
@@ -187,8 +208,6 @@ class PollingAgent:
                      paper_id, opp["pair_id"], opp["profit_pct"]*100, sizing["net_profit"])
             if dry:
                 log.info("[DRY RUN] Would place orders — skipping execution")
-            else:
-                pass  # order execution goes here in Phase 3
             alerted += 1
 
         # Mark-to-market every still-open paper trade. Runs even on cycles

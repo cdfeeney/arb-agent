@@ -134,6 +134,11 @@ exit:
   max_slippage_pct: 0.02            # downgrade EXIT to HOLD if VWAP slips >2% from best bid
   cooldown_minutes: 60              # don't re-enter exited pairs for this long
   min_days_remaining_to_force_hold: 0.5   # within 12h of resolution, always hold
+  partial_unwind_min_size: 0.1      # smallest unwind worth executing (in contracts).
+                                    # With $1-3 stakes on $100 bankroll, positions hold
+                                    # 1-3 contracts; 0.1 lets the monitor exit fractionally
+                                    # in dry-run to capture realized P&L data overnight.
+                                    # Live mode will need integer floors per platform.
 
 # Correlated-lag detector (Phase 2 strategy). When BTC moves significantly
 # but Kalshi crypto markets haven't repriced, emit a directional signal.
