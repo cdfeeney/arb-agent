@@ -79,28 +79,31 @@ def size_position(opportunity: dict, cfg: dict) -> dict:
     # that side's bid-book USD depth. Use BID prices in the denominator (not
     # ask) since bid-side USD/bid-side price is the contract count we can
     # actually unload at the top of book.
+    #
+    # CRITICAL CHANGE: missing bid depth on EITHER side now REJECTS the trade
+    # outright. Previously we clamped to min_bet, which produced positions
+    # that were inherently unexitable (one leg has no buyers → can't sell).
+    # On a $100 bankroll where every dollar of capital lockup costs us, we
+    # only enter arbs where both sides have a real takeable bid book.
     depth_fraction = float(cfg.get("book_depth_fraction", 0.25))
     yes_bid_depth = float(opportunity["buy_yes"].get("yes_bid_depth_usd", 0) or 0)
     no_bid_depth = float(opportunity["buy_no"].get("no_bid_depth_usd", 0) or 0)
-    yes_bid = float(opportunity["buy_yes"].get("yes_bid", 0) or yes_price)
-    no_bid = float(opportunity["buy_no"].get("no_bid", 0) or no_price)
-    if yes_bid_depth > 0 and no_bid_depth > 0 and yes_bid > 0 and no_bid > 0:
-        max_yes_unwind_usd = yes_bid_depth * depth_fraction
-        max_no_unwind_usd = no_bid_depth * depth_fraction
-        max_contracts_yes_depth = max_yes_unwind_usd / yes_bid
-        max_contracts_no_depth = max_no_unwind_usd / no_bid
-        max_contracts_depth = min(max_contracts_yes_depth, max_contracts_no_depth)
-        book_depth_cap = max_contracts_depth * cost_per_contract
-    else:
-        # Bid depth unavailable — clamp to min_bet, NOT bankroll. Previously
-        # we removed the cap, which on a $100 account meant "no depth data"
-        # could send full bankroll into a position with unverifiable exit.
-        book_depth_cap = float(cfg.get("min_bet", 5))
+    yes_bid = float(opportunity["buy_yes"].get("yes_bid", 0) or 0)
+    no_bid = float(opportunity["buy_no"].get("no_bid", 0) or 0)
+    if yes_bid_depth <= 0 or no_bid_depth <= 0 or yes_bid <= 0 or no_bid <= 0:
         log.warning(
-            "sizing book-depth cap: missing depth (yes_dep=%.2f no_dep=%.2f "
-            "yes_bid=%.4f no_bid=%.4f) → clamp to min_bet $%.2f",
-            yes_bid_depth, no_bid_depth, yes_bid, no_bid, book_depth_cap,
+            "size_position rejected: missing bid depth (yes_dep=$%.2f no_dep=$%.2f "
+            "yes_bid=%.4f no_bid=%.4f) — position would be unexitable",
+            yes_bid_depth, no_bid_depth, yes_bid, no_bid,
         )
+        return _reject_sizing(opportunity, "missing_bid_depth")
+
+    max_yes_unwind_usd = yes_bid_depth * depth_fraction
+    max_no_unwind_usd = no_bid_depth * depth_fraction
+    max_contracts_yes_depth = max_yes_unwind_usd / yes_bid
+    max_contracts_no_depth = max_no_unwind_usd / no_bid
+    max_contracts_depth = min(max_contracts_yes_depth, max_contracts_no_depth)
+    book_depth_cap = max_contracts_depth * cost_per_contract
 
     # Apply all caps. Note: NO min_bet floor here — if computed stake is
     # below min_bet, the caller should drop the opportunity entirely
