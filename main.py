@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from src.agent.poller import PollingAgent
 from src.config import load_config
 from src.db.store import Database
+from src.exec.safety import init_safety_schema, is_stopped
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,6 +21,14 @@ async def main() -> None:
     config = load_config("config.yaml")
     db = Database(config["database"]["path"])
     await db.init()
+    await init_safety_schema(config["database"]["path"])
+    stopped, reason = is_stopped()
+    if stopped:
+        log.warning(
+            "STOP file present at startup: %s — real sends will be blocked "
+            "until removed (use `python -m scripts.start`).",
+            reason,
+        )
     agent = PollingAgent(config, db)
 
     feed_task: asyncio.Task | None = None

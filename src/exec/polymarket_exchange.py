@@ -29,6 +29,7 @@ import os
 
 from .base import OrderPlan
 from .exchange import FillState, MarketSellResult, PlaceResult
+from .safety import safety_gate
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +63,8 @@ class PolymarketExchange:
         funder: str | None = None,
         allow_send: bool = False,
         host: str = "https://clob.polymarket.com",
+        db_path: str | None = None,
+        max_orders_per_day: int = 0,
     ):
         self._pc = poly_client
         self._private_key = private_key
@@ -70,6 +73,8 @@ class PolymarketExchange:
         self._host = host
         self._clob = None  # lazy — only constructed if/when we actually trade
         self._import = _import_clob_client()
+        self._db_path = db_path
+        self._max_per_day = int(max_orders_per_day or 0)
 
     def _ensure_client(self):
         if self._clob is not None:
@@ -114,6 +119,11 @@ class PolymarketExchange:
                 plan.token[:16], plan.side, plan.price_limit, plan.contracts, fake,
             )
             return PlaceResult(external_order_id=fake, accepted=True)
+        allowed, reason = await safety_gate(self._db_path, self._max_per_day)
+        if not allowed:
+            log.error("Polymarket place_order BLOCKED by safety gate: %s", reason)
+            return PlaceResult("", False, error=f"safety_gate: {reason}")
+        # gate has consumed one daily-cap slot already
         try:
             return await asyncio.to_thread(self._place_sync, plan)
         except Exception as e:
@@ -167,6 +177,11 @@ class PolymarketExchange:
                 token[:16], target_price, contracts, fake,
             )
             return PlaceResult(external_order_id=fake, accepted=True)
+        allowed, reason = await safety_gate(self._db_path, self._max_per_day)
+        if not allowed:
+            log.error("Polymarket place_maker_sell BLOCKED by safety gate: %s", reason)
+            return PlaceResult("", False, error=f"safety_gate: {reason}")
+        # gate has consumed one daily-cap slot already
         try:
             return await asyncio.to_thread(
                 self._place_maker_sync, token, target_price, contracts,

@@ -29,6 +29,7 @@ import httpx
 
 from .base import OrderPlan
 from .exchange import FillState, MarketSellResult, PlaceResult
+from .safety import safety_gate
 
 log = logging.getLogger(__name__)
 
@@ -41,10 +42,19 @@ def _price_in_cents(price_dollars: float) -> int:
 class KalshiExchange:
     name = "kalshi"
 
-    def __init__(self, kalshi_client, allow_send: bool = False, timeout: float = 15.0):
+    def __init__(
+        self,
+        kalshi_client,
+        allow_send: bool = False,
+        timeout: float = 15.0,
+        db_path: str | None = None,
+        max_orders_per_day: int = 0,
+    ):
         self._kc = kalshi_client
         self.allow_send = bool(allow_send)
         self.timeout = timeout
+        self._db_path = db_path
+        self._max_per_day = int(max_orders_per_day or 0)
 
     # ---- helpers ----
 
@@ -96,6 +106,12 @@ class KalshiExchange:
                 json.dumps(body), fake_id,
             )
             return PlaceResult(external_order_id=fake_id, accepted=True)
+        allowed, reason = await safety_gate(self._db_path, self._max_per_day)
+        if not allowed:
+            log.error("Kalshi place_order BLOCKED by safety gate: %s", reason)
+            return PlaceResult("", False, error=f"safety_gate: {reason}")
+        # NOTE: gate has ALREADY consumed one daily-cap slot. Do NOT
+        # increment again on success.
         try:
             code, data = await self._send("POST", "/portfolio/orders", body)
         except Exception as e:
@@ -184,6 +200,11 @@ class KalshiExchange:
                 realized_usd=round(contracts * avg_price, 4),
                 avg_price=round(avg_price, 4),
             )
+        allowed, reason = await safety_gate(self._db_path, self._max_per_day)
+        if not allowed:
+            log.error("Kalshi market_sell BLOCKED by safety gate: %s", reason)
+            return MarketSellResult(0.0, 0.0, 0.0, error=f"safety_gate: {reason}")
+        # gate has consumed one daily-cap slot already
         try:
             code, data = await self._send("POST", "/portfolio/orders", body)
         except Exception as e:

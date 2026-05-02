@@ -177,6 +177,13 @@ execution:
   naked_leg_timeout_seconds: 2.0      # one-leg-filled grace before we cancel
                                       # laggard + market-sell the filled leg
   per_leg_timeout_seconds: 5.0        # total wait before giving up on both legs
+  max_live_orders_per_day: 10         # hard cap on real exchange orders per UTC day.
+                                      # When exceeded, every executor refuses further
+                                      # real sends AND auto-creates data/STOP so the
+                                      # block persists past midnight UTC. Conservative
+                                      # starting value for early live trading; raise
+                                      # once we have ≥1 week of stable operation.
+                                      # Set to 0 to disable the cap.
 
 # Position-monitor / exit logic. Each cycle, mark-to-market every open paper
 # trade; recommend EXIT when convergence threshold hit OR when annualized

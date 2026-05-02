@@ -23,6 +23,8 @@ def build_exchange_registry(
 ) -> dict[str, Exchange]:
     exec_cfg = (config.get("execution", {}) or {})
     allow_send = bool(exec_cfg.get("allow_send", False))
+    max_per_day = int(exec_cfg.get("max_live_orders_per_day", 0) or 0)
+    db_path = (config.get("database", {}) or {}).get("path")
     registry: dict[str, Exchange] = {}
 
     # ---- Kalshi: keys already required by the bot for read access, so a live
@@ -33,9 +35,12 @@ def build_exchange_registry(
             registry["kalshi"] = KalshiExchange(
                 kalshi_client=kalshi_client,
                 allow_send=allow_send,
+                db_path=db_path,
+                max_orders_per_day=max_per_day,
             )
             log.info(
-                "Registered KalshiExchange (allow_send=%s)", allow_send,
+                "Registered KalshiExchange (allow_send=%s, max/day=%d)",
+                allow_send, max_per_day,
             )
         except Exception as e:
             log.warning("KalshiExchange not registered: %s", e)
@@ -51,10 +56,13 @@ def build_exchange_registry(
                 private_key=pm_key,
                 funder=pm_funder,
                 allow_send=allow_send,
+                db_path=db_path,
+                max_orders_per_day=max_per_day,
             )
             log.info(
-                "Registered PolymarketExchange (allow_send=%s, funder=%s)",
-                allow_send, "set" if pm_funder else "default",
+                "Registered PolymarketExchange (allow_send=%s, funder=%s, "
+                "max/day=%d)",
+                allow_send, "set" if pm_funder else "default", max_per_day,
             )
         except Exception as e:
             log.warning("PolymarketExchange not registered: %s", e)
