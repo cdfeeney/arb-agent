@@ -172,7 +172,7 @@ async def _freshness_section(db: aiosqlite.Connection) -> None:
         print("  (no paper_trade_marks table yet — monitor never ran)")
         return
     cur = await db.execute(
-        "SELECT MAX(marked_at) last_mark FROM paper_trade_marks",
+        "SELECT MAX(observed_at) last_mark FROM paper_trade_marks",
     )
     row = await cur.fetchone()
     last = row["last_mark"] if row else None
