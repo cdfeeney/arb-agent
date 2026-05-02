@@ -69,6 +69,12 @@ class ExitConfig:
     partial_unwind_min_size: float      # smallest unwind worth executing (contracts)
     near_resolution_spike_fee_multiple: float  # within force-hold window, only override
                                                 # if net realized > exit_fees × this
+    min_capture_above_fees: float       # require gross capture ≥ exit_fees × (1+this)
+                                        # so net is meaningfully positive, not just $0.01.
+                                        # The old `net > 0` gate let cycles where exit
+                                        # fees ate ~95% of the gross fire as PARTIAL_UNWIND;
+                                        # those exits realize a few cents, leaving sunk
+                                        # entry fees underwater. See trade #379 forensics.
     maker_exit: MakerExitConfig
 
     @classmethod
@@ -85,6 +91,9 @@ class ExitConfig:
             partial_unwind_min_size=float(d.get("partial_unwind_min_size", 1.0)),
             near_resolution_spike_fee_multiple=float(
                 d.get("near_resolution_spike_fee_multiple", 2.0),
+            ),
+            min_capture_above_fees=float(
+                d.get("min_capture_above_fees", 1.5),
             ),
             maker_exit=MakerExitConfig.from_dict(d.get("maker_exit", {})),
         )
@@ -268,9 +277,15 @@ def _decide(
         )
 
     # Fee gate: exit fees on selling `raw_size` contracts on both legs at the
-    # current bids. If we don't clear those fees, holding to resolution is
-    # strictly better — we already paid entry fees, exit fees on a barely-
-    # profitable unwind just compound the drag.
+    # current bids. The old gate was "net > 0" — any positive net fired an
+    # exit. That's wrong: when the gross convergence barely exceeds the
+    # round-trip exit fees, we burn entry fees that hold-to-resolution would
+    # have recouped at no exit cost. Require net to be meaningfully positive
+    # by demanding gross ≥ exit_fees × (1 + min_capture_above_fees).
+    #
+    # See trade #379 forensics: gross $0.153, exit_fees $0.124, net $0.029
+    # → old gate fired PARTIAL_UNWIND. Hold-to-resolution would have
+    # delivered the remaining $0.21 of convergence at zero exit fee.
     exit_fees = 0.0
     if fee_cfg is not None and mark.buy_yes is not None and mark.buy_no is not None:
         exit_fees = compute_unwind_fees(
@@ -278,12 +293,14 @@ def _decide(
         )
     gross_realized = gross_profit_per_contract * raw_size
     net_realized = gross_realized - exit_fees
-    if net_realized <= 0:
+    required_net = cfg.min_capture_above_fees * exit_fees
+    if net_realized < required_net:
         return (
             "WATCH",
-            f"top-of-book {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} clears "
-            f"cost but exit fees ${exit_fees:.2f} on {raw_size:.1f} contracts "
-            f"swallow the gross ${gross_realized:.2f}",
+            f"top-of-book {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} clears cost "
+            f"but net ${net_realized:.4f} < {cfg.min_capture_above_fees:.1f}× "
+            f"exit_fees ${exit_fees:.4f} on {raw_size:.2f}c — wait for "
+            f"better convergence or hold to resolution",
             raw_size,
         )
 
@@ -291,7 +308,8 @@ def _decide(
         "PARTIAL_UNWIND",
         f"top-of-book {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} > "
         f"cost {mark.cost_per_contract:.4f}, sell {raw_size:.2f} contracts "
-        f"net ${net_realized:.2f} (gross ${gross_realized:.2f} - fees ${exit_fees:.2f})",
+        f"net ${net_realized:.2f} (gross ${gross_realized:.2f} - fees ${exit_fees:.2f}, "
+        f"buffer {net_realized/exit_fees if exit_fees else float('inf'):.1f}×)",
         raw_size,
     )
 

@@ -67,6 +67,7 @@ _CFG = ExitConfig(
     min_days_remaining_to_force_hold=0.25,
     partial_unwind_min_size=0.1,
     near_resolution_spike_fee_multiple=2.0,
+    min_capture_above_fees=1.5,
     maker_exit=MakerExitConfig(
         enabled=False, spread_above_bid=0.01, max_age_seconds=300,
         polymarket_only=True,

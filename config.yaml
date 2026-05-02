@@ -207,6 +207,18 @@ exit:
                                           # Default 2x means the spike must be clearly
                                           # real (covers exit fees and doubles them in
                                           # profit) not just barely-above-zero.
+  min_capture_above_fees: 1.5       # require taker-exit gross capture to exceed
+                                    # exit fees by this multiple before firing
+                                    # PARTIAL_UNWIND. Default 1.5 means net must
+                                    # be ≥ 1.5× exit_fees, i.e. gross ≥ 2.5×
+                                    # exit_fees. Prevents the "$0.02 net after $0.12
+                                    # exit fees" bleed where we throw away unrealized
+                                    # convergence + sunk entry fees. Maker-exit
+                                    # path runs first (0% poly fee) when it fires;
+                                    # this gate is the safety floor for the
+                                    # taker fallback. Set to 0 to revert to old
+                                    # "any positive net" behavior. See trade #379
+                                    # forensics in scripts/why_closed.py output.
   partial_unwind_min_size: 0.1      # smallest unwind worth executing (in contracts).
                                     # With $1-3 stakes on $100 bankroll, positions hold
                                     # 1-3 contracts; 0.1 lets the monitor exit fractionally
