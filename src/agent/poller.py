@@ -403,7 +403,7 @@ class PollingAgent:
                 )
                 if mon["n_open"] > 0:
                     log.info(
-                        "Monitor: open=%d marked=%d UNWIND=%d CLOSED=%d WATCH=%d HOLD=%d (book=%d notmoved=%d near_res=%d other=%d) skipped=%d realized_this_cycle=$%.2f",
+                        "Monitor: open=%d marked=%d UNWIND=%d CLOSED=%d WATCH=%d HOLD=%d (book=%d notmoved=%d near_res=%d other=%d) MAKER(placed=%d filled=%d resting=%d cancel=%d) skipped=%d realized_this_cycle=$%.2f",
                         mon["n_open"], mon["n_marked"],
                         mon["partial_unwinds"], mon["fully_closed"],
                         mon["watches"], mon["holds"],
@@ -411,6 +411,10 @@ class PollingAgent:
                         mon.get("hold_market_not_moved", 0),
                         mon.get("hold_near_resolution", 0),
                         mon.get("hold_other", 0),
+                        mon.get("maker_placed", 0),
+                        mon.get("maker_filled", 0),
+                        mon.get("maker_resting", 0),
+                        mon.get("maker_cancelled", 0),
                         mon["skipped"],
                         mon["realized_this_cycle"],
                     )

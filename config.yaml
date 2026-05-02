@@ -205,6 +205,16 @@ exit:
                                     # 1-3 contracts; 0.1 lets the monitor exit fractionally
                                     # in dry-run to capture realized P&L data overnight.
                                     # Live mode will need integer floors per platform.
+  maker_exit:                       # profit ideas #1: 0% Polymarket maker fee capture.
+                                    # When PARTIAL_UNWIND fires on a position with a
+                                    # Polymarket leg, REST a sell-limit at best_bid +
+                                    # spread instead of taker-exiting. ~40% lift on net
+                                    # realized when filled. If not filled within
+                                    # max_age_seconds, cancel and fall back to taker.
+    enabled: true
+    spread_above_bid: 0.01          # how many ¢ above current best_bid to rest at
+    max_age_seconds: 300            # 5 min before cancel + taker fallback
+    polymarket_only: true           # Kalshi has same fee both sides → no maker benefit
 
 # Correlated-lag detector (Phase 2 strategy). When BTC moves significantly
 # but Kalshi crypto markets haven't repriced, emit a directional signal.

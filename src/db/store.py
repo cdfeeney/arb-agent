@@ -230,6 +230,37 @@ class Database:
                 )
             """)
 
+            # Maker-exit limit orders (#35). Polymarket charges 0% to makers
+            # vs 4-7% to takers — so resting a sell-limit ABOVE the current
+            # bid (in the spread) and waiting for a buyer captures the spread
+            # AND avoids the exit fee. ~40% lift on net realized vs taker-exit.
+            #
+            # In paper mode the order is "synthetic" — we record what we would
+            # have placed, then check each cycle whether the market's best bid
+            # has moved up to >= our target_price (which would have filled us).
+            # If aged out without a fill, cancel and fall back to taker exit.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS maker_exit_orders (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_trade_id      INTEGER NOT NULL,
+                    leg                 TEXT NOT NULL,             -- 'yes' or 'no'
+                    platform            TEXT NOT NULL,             -- 'polymarket' (Kalshi has same fee both sides — no benefit)
+                    target_price        REAL NOT NULL,             -- our resting sell price
+                    contracts           REAL NOT NULL,
+                    placed_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status              TEXT DEFAULT 'resting',    -- resting | filled | cancelled
+                    filled_at           TIMESTAMP,
+                    fill_price          REAL,
+                    realized_gross_usd  REAL,
+                    cancelled_at        TIMESTAMP,
+                    cancel_reason       TEXT
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_maker_paper "
+                "ON maker_exit_orders(paper_trade_id, status)"
+            )
+
             # Migration: older paper_trades rows were saved before we captured
             # the Polymarket clob token ids. Position monitor needs them to
             # fetch live bid books for the unwind-value calculation. Add the
@@ -688,6 +719,79 @@ class Database:
                 "partial_realized_usd": new_realized,
                 "fully_closed": fully_closed,
             }
+
+    # ----- maker-exit orders (#35) -----
+
+    async def list_resting_maker_orders(
+        self, paper_trade_id: int | None = None,
+    ) -> list[dict]:
+        """All currently-resting maker exit orders. If paper_trade_id given,
+        filter to just that trade. Used by position monitor to decide whether
+        a trade already has an outstanding maker order."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            if paper_trade_id is not None:
+                cur = await db.execute(
+                    "SELECT * FROM maker_exit_orders "
+                    "WHERE paper_trade_id=? AND status='resting' "
+                    "ORDER BY placed_at",
+                    (paper_trade_id,),
+                )
+            else:
+                cur = await db.execute(
+                    "SELECT * FROM maker_exit_orders WHERE status='resting' "
+                    "ORDER BY placed_at",
+                )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def record_maker_order(
+        self,
+        paper_trade_id: int,
+        leg: str,
+        platform: str,
+        target_price: float,
+        contracts: float,
+    ) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute(
+                """INSERT INTO maker_exit_orders (
+                    paper_trade_id, leg, platform, target_price, contracts
+                ) VALUES (?,?,?,?,?)""",
+                (paper_trade_id, leg, platform,
+                 round(float(target_price), 4), round(float(contracts), 4)),
+            )
+            await db.commit()
+            return cur.lastrowid
+
+    async def mark_maker_filled(
+        self,
+        order_id: int,
+        fill_price: float,
+        realized_gross_usd: float,
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """UPDATE maker_exit_orders
+                   SET status='filled', filled_at=?, fill_price=?,
+                       realized_gross_usd=?
+                   WHERE id=? AND status='resting'""",
+                (datetime.now(timezone.utc).isoformat(),
+                 round(float(fill_price), 4),
+                 round(float(realized_gross_usd), 4),
+                 order_id),
+            )
+            await db.commit()
+
+    async def mark_maker_cancelled(self, order_id: int, reason: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """UPDATE maker_exit_orders
+                   SET status='cancelled', cancelled_at=?, cancel_reason=?
+                   WHERE id=? AND status='resting'""",
+                (datetime.now(timezone.utc).isoformat(), reason, order_id),
+            )
+            await db.commit()
 
     async def add_pair_cooldown(self, pair_id: str, reason: str) -> None:
         async with aiosqlite.connect(self.path) as db:

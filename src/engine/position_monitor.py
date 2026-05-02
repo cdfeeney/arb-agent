@@ -30,6 +30,35 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class MakerExitConfig:
+    """Polymarket maker-exit limit orders (#35).
+
+    Polymarket charges 0% to makers vs 4-7% to takers. Resting a sell-limit
+    above the current bid (in the spread) and waiting for a buyer captures
+    the spread AND avoids the taker fee — ~40% lift on net realized vs
+    taker-on-both-legs. Kalshi has the same fee both sides → no maker
+    advantage there, so this only applies to the Polymarket leg.
+
+    Atomic fill (paper sim): when the Poly bid moves up to >= target_price,
+    we'd be filled. At that moment we simultaneously taker-sell the Kalshi
+    leg to preserve the hedge.
+    """
+    enabled: bool
+    spread_above_bid: float       # how much above current best_bid to rest at
+    max_age_seconds: float        # cancel + taker-fallback if not filled in this long
+    polymarket_only: bool         # leave True — Kalshi has no maker benefit
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MakerExitConfig":
+        return cls(
+            enabled=bool(d.get("enabled", True)),
+            spread_above_bid=float(d.get("spread_above_bid", 0.01)),
+            max_age_seconds=float(d.get("max_age_seconds", 300.0)),
+            polymarket_only=bool(d.get("polymarket_only", True)),
+        )
+
+
+@dataclass(frozen=True)
 class ExitConfig:
     enabled: bool
     convergence_threshold: float       # exit when this fraction of arb captured
@@ -40,6 +69,7 @@ class ExitConfig:
     partial_unwind_min_size: float      # smallest unwind worth executing (contracts)
     near_resolution_spike_fee_multiple: float  # within force-hold window, only override
                                                 # if net realized > exit_fees × this
+    maker_exit: MakerExitConfig
 
     @classmethod
     def from_dict(cls, d: dict) -> "ExitConfig":
@@ -56,6 +86,7 @@ class ExitConfig:
             near_resolution_spike_fee_multiple=float(
                 d.get("near_resolution_spike_fee_multiple", 2.0),
             ),
+            maker_exit=MakerExitConfig.from_dict(d.get("maker_exit", {})),
         )
 
 
@@ -321,6 +352,232 @@ def _try_resolution_spike_capture(
     )
 
 
+def _polymarket_leg(mark: TradeMark) -> tuple[str, dict, "LegMark"] | None:
+    """Identify which leg (yes/no) is on Polymarket. Returns (leg_name,
+    buy_market_dict, leg_mark) or None if neither leg is on Polymarket."""
+    if (mark.buy_yes or {}).get("platform") == "polymarket":
+        return ("yes", mark.buy_yes, mark.yes_leg)
+    if (mark.buy_no or {}).get("platform") == "polymarket":
+        return ("no", mark.buy_no, mark.no_leg)
+    return None
+
+
+async def _try_place_maker_exit(
+    db,
+    trade: dict,
+    mark: TradeMark,
+    unwind_size: float,
+    cfg: ExitConfig,
+    summary: dict,
+) -> str | None:
+    """Place a maker sell-limit on the Polymarket leg at best_bid + spread.
+    Returns the decision-reason string on success, or None to fall through
+    to the normal taker partial-unwind path."""
+    poly_info = _polymarket_leg(mark)
+    if poly_info is None:
+        return None  # no poly leg → no maker advantage
+    poly_leg_name, _poly_market, poly_leg_mark = poly_info
+    if poly_leg_mark.best_bid <= 0:
+        return None  # need a bid to compute target_price
+    target_price = round(
+        poly_leg_mark.best_bid + cfg.maker_exit.spread_above_bid, 4,
+    )
+    if target_price >= 1.0:
+        return None  # would price above $1, nonsensical
+    # Don't place a duplicate if one is already resting (defensive — caller
+    # checked too, but DB is the source of truth).
+    existing = await db.list_resting_maker_orders(int(trade["id"]))
+    if existing:
+        return None
+    order_id = await db.record_maker_order(
+        paper_trade_id=int(trade["id"]),
+        leg=poly_leg_name,
+        platform="polymarket",
+        target_price=target_price,
+        contracts=unwind_size,
+    )
+    summary["maker_placed"] += 1
+    log.info(
+        "MAKER_PLACED trade #%d: rest %s leg @$%.4f for %.2f contracts "
+        "(poly bid now=%.4f + spread=%.4f) order #%d",
+        trade["id"], poly_leg_name, target_price, unwind_size,
+        poly_leg_mark.best_bid, cfg.maker_exit.spread_above_bid, order_id,
+    )
+    return (
+        f"maker rest: {poly_leg_name} leg target=${target_price:.4f} "
+        f"size={unwind_size:.2f} (waiting for poly bid to reach target)"
+    )
+
+
+async def _handle_resting_maker(
+    db,
+    trade: dict,
+    mark: TradeMark,
+    order: dict,
+    cfg: ExitConfig,
+    fee_cfg: dict | None,
+    summary: dict,
+    dry_run: bool,
+) -> str:
+    """Decide what to do with a resting maker order.
+
+    Returns:
+        "filled"    — atomic fill applied + mark written; skip _decide
+        "resting"   — still waiting; mark written; skip _decide
+        "cancelled" — aged out; fall through to _decide for taker fallback
+    """
+    from datetime import datetime, timezone
+    placed_at = order.get("placed_at")
+    target_price = float(order["target_price"])
+    contracts = float(order["contracts"])
+    leg_name = order["leg"]
+
+    # Identify the polymarket leg's current bid + the OTHER leg (which we'd
+    # taker-sell on fill). Order's `leg` tells us which side maker rests on.
+    if leg_name == "yes":
+        poly_leg_mark = mark.yes_leg
+        other_leg_mark = mark.no_leg
+        other_market = mark.buy_no
+        other_leg_name = "no"
+    else:
+        poly_leg_mark = mark.no_leg
+        other_leg_mark = mark.yes_leg
+        other_market = mark.buy_yes
+        other_leg_name = "yes"
+
+    # Fill check: if the polymarket-leg best_bid has moved up to or past
+    # our target_price, a buyer would have crossed our resting ask.
+    poly_bid = poly_leg_mark.best_bid
+    fill_now = (
+        poly_leg_mark.book_available
+        and poly_bid > 0
+        and poly_bid >= target_price
+        and other_leg_mark.book_available
+        and other_leg_mark.best_bid > 0
+    )
+
+    age_seconds = _maker_order_age_seconds(placed_at)
+    aged_out = age_seconds is not None and age_seconds >= cfg.maker_exit.max_age_seconds
+
+    if fill_now:
+        # Atomic fill: poly leg fills at target_price (no fee), other leg
+        # taker-sold at current best_bid (pays its taker fee).
+        kalshi_fee_rate = float((fee_cfg or {}).get("kalshi_fee_rate", 0.07))
+        kalshi_taker_fee = (
+            kalshi_fee_rate * contracts * other_leg_mark.best_bid
+            if (other_market or {}).get("platform") == "kalshi" else 0.0
+        )
+        gross_per_contract = (
+            target_price + other_leg_mark.best_bid - mark.cost_per_contract
+        )
+        gross_realized = gross_per_contract * contracts
+        net_realized = round(gross_realized - kalshi_taker_fee, 4)
+        await db.mark_maker_filled(
+            int(order["id"]),
+            fill_price=target_price,
+            realized_gross_usd=round(gross_realized, 4),
+        )
+        summary["maker_filled"] += 1
+        summary["realized_this_cycle"] += net_realized
+        log.info(
+            "MAKER_FILLED trade #%d: poly %s leg filled @$%.4f + %s %s leg "
+            "taker @$%.4f → gross $%.2f net $%.2f (saved poly taker fee)",
+            trade["id"], leg_name, target_price,
+            (other_market or {}).get("platform", "?"), other_leg_name,
+            other_leg_mark.best_bid, gross_realized, net_realized,
+        )
+        # Persist the mark + apply partial unwind (mirrors the taker path)
+        mark.recommendation = "MAKER_FILLED"
+        mark.reason = (
+            f"maker fill: poly={target_price:.4f} other_bid={other_leg_mark.best_bid:.4f} "
+            f"gross=${gross_realized:.2f} net=${net_realized:.2f}"
+        )
+        mark.partial_unwind_size = contracts
+        mark.partial_unwind_realized = net_realized
+        await _persist_mark(db, mark, "MAKER_FILLED", mark.reason, contracts, net_realized)
+        if dry_run:
+            result = await db.apply_partial_unwind(
+                int(trade["id"]), contracts, net_realized,
+            )
+            if result["fully_closed"]:
+                summary["fully_closed"] += 1
+                log.info(
+                    "CLOSED trade #%d (via maker): total realized $%.2f",
+                    trade["id"], result["partial_realized_usd"],
+                )
+                await db.add_pair_cooldown(
+                    trade["pair_id"],
+                    f"maker-closed: realized ${result['partial_realized_usd']:.2f}",
+                )
+        return "filled"
+
+    if aged_out:
+        await db.mark_maker_cancelled(
+            int(order["id"]),
+            reason=f"aged_out:{age_seconds:.0f}s>{cfg.maker_exit.max_age_seconds:.0f}s",
+        )
+        summary["maker_cancelled"] += 1
+        log.info(
+            "MAKER_CANCELLED trade #%d: order #%d aged %0.0fs > max %.0fs — "
+            "falling back to taker decision",
+            trade["id"], order["id"], age_seconds, cfg.maker_exit.max_age_seconds,
+        )
+        return "cancelled"
+
+    # Still resting
+    summary["maker_resting"] += 1
+    mark.recommendation = "MAKER_RESTING"
+    mark.reason = (
+        f"maker resting: target=${target_price:.4f} poly_bid=${poly_bid:.4f} "
+        f"age={age_seconds:.0f}s/{cfg.maker_exit.max_age_seconds:.0f}s"
+    )
+    await _persist_mark(db, mark, "MAKER_RESTING", mark.reason, 0.0, 0.0)
+    return "resting"
+
+
+def _maker_order_age_seconds(placed_at: str | None) -> float | None:
+    if not placed_at:
+        return None
+    try:
+        # SQLite default: "YYYY-MM-DD HH:MM:SS" (naive UTC)
+        dt = datetime.fromisoformat(placed_at.replace(" ", "T"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
+async def _persist_mark(
+    db, mark: TradeMark, recommendation: str, reason: str,
+    partial_size: float, partial_realized: float,
+) -> None:
+    """Shared helper: write a paper_trade_marks row with the given decision."""
+    await db.save_paper_trade_mark({
+        "paper_trade_id": mark.paper_trade_id,
+        "yes_bid_now": mark.yes_leg.best_bid,
+        "yes_bid_vwap": mark.yes_leg.vwap_bid,
+        "yes_bid_fill_contracts": mark.yes_leg.fill_contracts,
+        "no_bid_now": mark.no_leg.best_bid,
+        "no_bid_vwap": mark.no_leg.vwap_bid,
+        "no_bid_fill_contracts": mark.no_leg.fill_contracts,
+        "cost_basis_usd": round(mark.cost_basis, 4),
+        "unwind_value_usd": round(mark.unwind_value, 4),
+        "locked_payout_usd": round(mark.locked_payout, 4),
+        "mark_to_market_usd": round(mark.mark_to_market, 4),
+        "convergence_ratio": round(mark.convergence_ratio, 4),
+        "slippage_pct": round(mark.slippage_pct, 4),
+        "days_held": round(mark.days_held, 4),
+        "days_remaining": round(mark.days_remaining, 4),
+        "annualized_now_pct": round(mark.annualized_now_pct, 2),
+        "annualized_to_close_pct": round(mark.annualized_to_close_pct, 2),
+        "exit_recommendation": recommendation,
+        "decision_reason": reason,
+        "partial_unwind_size": round(partial_size, 4) if partial_size > 0 else None,
+        "partial_unwind_realized_usd": partial_realized if partial_size > 0 else None,
+    })
+
+
 async def monitor_open_positions(
     db: Database,
     kalshi: KalshiClient,
@@ -353,6 +610,11 @@ async def monitor_open_positions(
         "hold_market_not_moved": 0,
         "hold_near_resolution": 0,
         "hold_other": 0,
+        # Maker-exit (#35) tally
+        "maker_placed": 0,
+        "maker_filled": 0,
+        "maker_resting": 0,
+        "maker_cancelled": 0,
     }
     if not cfg.enabled:
         return summary
@@ -376,6 +638,13 @@ async def monitor_open_positions(
 
     marks = await asyncio.gather(*(_bounded_build(t) for t in open_trades))
 
+    # Pre-load any resting maker orders so we can check fills before _decide.
+    # Single query → dict by paper_trade_id; cheap.
+    resting_orders_by_trade: dict[int, list[dict]] = {}
+    if cfg.maker_exit.enabled:
+        for o in await db.list_resting_maker_orders():
+            resting_orders_by_trade.setdefault(int(o["paper_trade_id"]), []).append(o)
+
     # Decision/persistence loop is fast and stays serial — DB writes shouldn't
     # interleave, and ordering (oldest-first) is preserved.
     for trade, mark in zip(open_trades, marks):
@@ -383,9 +652,50 @@ async def monitor_open_positions(
             if mark is None:
                 summary["skipped"] += 1
                 continue
+
+            # Maker-exit (#35): handle resting orders first. If we have one
+            # for this trade and it would fill THIS cycle, atomically:
+            #   * fill the maker leg at target_price (poly, 0% fee)
+            #   * taker-sell the OTHER leg at its current best_bid
+            #   * apply_partial_unwind with the combined realized
+            # If aged out: cancel and fall through to normal _decide for
+            # taker-fallback. If still resting: skip _decide this cycle.
+            existing = resting_orders_by_trade.get(int(trade["id"]), [])
+            if existing:
+                outcome = await _handle_resting_maker(
+                    db, trade, mark, existing[0], cfg, fee_cfg, summary, dry_run,
+                )
+                if outcome in ("filled", "resting"):
+                    # Either we already wrote a mark + applied unwind (filled)
+                    # or we're waiting (resting); skip the normal _decide path
+                    continue
+                # outcome == "cancelled": fall through to normal _decide so
+                # this cycle can taker-exit if conditions still warrant it
+
             recommendation, reason, unwind_size = _decide(mark, cfg, fee_cfg)
             mark.recommendation = recommendation
             mark.reason = reason
+
+            # Maker-exit (#35): if PARTIAL_UNWIND is signaled and the position
+            # has a Polymarket leg, REST a maker order on Polymarket instead
+            # of taker-exiting both legs now. We capture the spread + skip
+            # the Poly taker fee (~40% lift on net realized).
+            if (
+                recommendation == "PARTIAL_UNWIND"
+                and unwind_size > 0
+                and cfg.maker_exit.enabled
+            ):
+                placed = await _try_place_maker_exit(
+                    db, trade, mark, unwind_size, cfg, summary,
+                )
+                if placed is not None:
+                    # Override decision so the persisted mark reflects what
+                    # happened, and skip the taker partial-unwind below.
+                    recommendation = "MAKER_PLACED"
+                    reason = placed
+                    mark.recommendation = recommendation
+                    mark.reason = reason
+                    unwind_size = 0  # don't trigger the taker block below
 
             partial_realized = 0.0
             if recommendation == "PARTIAL_UNWIND" and unwind_size > 0:

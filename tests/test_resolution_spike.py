@@ -8,7 +8,7 @@ N × exit_fees, take the unwind — the spike won't last to resolution.
 from __future__ import annotations
 
 from src.engine.position_monitor import (
-    ExitConfig, LegMark, TradeMark, _decide,
+    ExitConfig, LegMark, MakerExitConfig, TradeMark, _decide,
 )
 
 
@@ -67,6 +67,10 @@ _CFG = ExitConfig(
     min_days_remaining_to_force_hold=0.25,
     partial_unwind_min_size=0.1,
     near_resolution_spike_fee_multiple=2.0,
+    maker_exit=MakerExitConfig(
+        enabled=False, spread_above_bid=0.01, max_age_seconds=300,
+        polymarket_only=True,
+    ),
 )
 
 
