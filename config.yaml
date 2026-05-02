@@ -232,7 +232,19 @@ exit:
                                     # max_age_seconds, cancel and fall back to taker.
     enabled: true
     spread_above_bid: 0.01          # how many ¢ above current best_bid to rest at
-    max_age_seconds: 300            # 5 min before cancel + taker fallback
+    max_age_seconds: 86400          # 24h before cancel + taker fallback. Reasoning
+                                    # (2026-05-02): the maker order is a free option
+                                    # — it doesn't lock additional capital beyond the
+                                    # underlying position we're already holding.
+                                    # Spreads tighten as resolution approaches; book
+                                    # sweeps periodically lift resting orders. Bailing
+                                    # to taker after 5 min just burns fees. The only
+                                    # real downside of a long-rest maker is "stale
+                                    # price" — if best_bid moves UP significantly past
+                                    # our target, we sell cheap. Future enhancement:
+                                    # cancel + reprice when best_bid > target + threshold.
+                                    # For now: 24h gives maximum chance to fill cleanly.
+                                    # Set lower if you observe stale-price losses.
     polymarket_only: true           # Kalshi has same fee both sides → no maker benefit
 
 # Correlated-lag detector (Phase 2 strategy). When BTC moves significantly
