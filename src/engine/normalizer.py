@@ -78,12 +78,16 @@ def normalize_kalshi(raw: dict) -> Optional[dict]:
             "yes_ask_depth_contracts": yes_ask_size,
             "no_ask_depth_contracts": no_ask_size,
             "closes_at": _parse_dt(raw.get("close_time")),
-            # XXX URL FORMAT UNVERIFIED — bare /markets/{ticker} returns 404
-            # in browser, and /markets/{event_ticker}/{ticker} (lowercase)
-            # ALSO returns 404 (tested 2026-05-02). Kalshi exposes no URL
-            # field in API. Do not trust this URL until pattern is verified
-            # by inspecting a working kalshi.com market page in browser.
-            "url": f"https://kalshi.com/markets/{raw.get('ticker', '')}",
+            # Kalshi URL pattern: /markets/{series_ticker_lower}. The series
+            # ticker is the leading hyphen-separated component of event_ticker
+            # (KXTRUMPOUT27-27 → KXTRUMPOUT27 → kxtrumpout27). The fuller
+            # /markets/{series}/{seo-slug}/{event_or_market} form requires an
+            # SEO slug Kalshi doesn't expose in the API, so this lands the
+            # operator on the series page where they can see all sub-markets
+            # in the basket. Verified pattern via search index 2026-05-02.
+            "url": _kalshi_series_url(
+                raw.get("event_ticker", "") or raw.get("ticker", "")
+            ),
         }
     except Exception as e:
         log.debug(f"normalize_kalshi failed: {e}")
@@ -167,6 +171,18 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
     except Exception as e:
         log.debug(f"normalize_polymarket failed: {e}")
         return None
+
+
+def _kalshi_series_url(event_or_ticker: str) -> str:
+    """Build kalshi.com series-page URL from an event_ticker or market ticker.
+
+    Strips to the leading component (the series) and lowercases. Empty input
+    falls back to the markets root rather than producing a guaranteed-404.
+    """
+    if not event_or_ticker:
+        return "https://kalshi.com/markets"
+    series = event_or_ticker.split("-", 1)[0].lower()
+    return f"https://kalshi.com/markets/{series}"
 
 
 def _parse_dt(s) -> Optional[datetime]:
