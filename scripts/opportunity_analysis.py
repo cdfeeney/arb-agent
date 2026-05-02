@@ -174,9 +174,12 @@ def _print_concentration_math(
         return
 
     days_with_data = max(1, len(daily))
+
+    def avg_per_day_at(thr: float) -> float:
+        return sum(1 for e in edges if e >= thr) / days_with_data
+
     avg_per_day = {
-        thr: sum(1 for e in edges if e >= thr) / days_with_data
-        for thr in [0.03, 0.05, 0.07, 0.10]
+        thr: avg_per_day_at(thr) for thr in [0.03, 0.05, 0.07, 0.10]
     }
 
     # Velocity assumption: median hold time on closed trades. If we have no
@@ -228,7 +231,7 @@ def _print_concentration_math(
         f = fees_pct(stake)
         net = avg_edge - f
         per_week = net * stake * len(top_n) * turnover_weekly
-        supply_ok = avg_per_day[floor] * 7 * weeks_per_trade >= n
+        supply_ok = avg_per_day_at(floor) * 7 * weeks_per_trade >= n
         marker = "OK" if supply_ok else "thin"
         print(f"  {n:>5} ${stake:>6.2f} {floor*100:>9.1f}% {avg_edge*100:>8.2f}% "
               f"{f*100:>5.2f}% {net*100:>5.2f}% ${per_week:>6.2f} {marker:>10}")
