@@ -78,6 +78,11 @@ def normalize_kalshi(raw: dict) -> Optional[dict]:
             "yes_ask_depth_contracts": yes_ask_size,
             "no_ask_depth_contracts": no_ask_size,
             "closes_at": _parse_dt(raw.get("close_time")),
+            # XXX URL FORMAT UNVERIFIED — bare /markets/{ticker} returns 404
+            # in browser, and /markets/{event_ticker}/{ticker} (lowercase)
+            # ALSO returns 404 (tested 2026-05-02). Kalshi exposes no URL
+            # field in API. Do not trust this URL until pattern is verified
+            # by inspecting a working kalshi.com market page in browser.
             "url": f"https://kalshi.com/markets/{raw.get('ticker', '')}",
         }
     except Exception as e:
@@ -135,6 +140,12 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
                 clob_tokens = json.loads(clob_tokens)
             except Exception:
                 clob_tokens = None
+        # Structural flags for matcher's neg-risk-sub-outcome reject. A market
+        # with negRisk=True AND a non-empty groupItemTitle is a sub-outcome of
+        # a "first/which X" basket — by construction only one outcome in the
+        # basket can resolve YES, so it cannot legitimately pair with a Kalshi
+        # binary YES/NO. Bug surfaced 2026-05-02 via paper trade #395
+        # (KXTRUMPOUT27-27-DJT vs Polymarket "next leader out" sub-outcome).
         return {
             "platform": "polymarket",
             "ticker": str(raw.get("id", "")),
@@ -149,6 +160,8 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
             "yes_token": clob_tokens[0] if clob_tokens and len(clob_tokens) >= 1 else None,
             "no_token":  clob_tokens[1] if clob_tokens and len(clob_tokens) >= 2 else None,
             "closes_at": _parse_dt(raw.get("endDate")),
+            "neg_risk": bool(raw.get("negRisk", False)),
+            "group_item_title": raw.get("groupItemTitle", "") or "",
             "url": f"https://polymarket.com/event/{url_slug}",
         }
     except Exception as e:

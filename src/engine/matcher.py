@@ -89,6 +89,28 @@ def match_markets(
     if not kalshi_markets or not poly_markets:
         return []
 
+    # Structural reject: Polymarket sub-outcomes of neg-risk multi-outcome
+    # baskets cannot legitimately pair with Kalshi YES/NO binaries. By
+    # construction the basket resolves at most one outcome to YES, so the
+    # binary "Will X happen?" and the sub-outcome "Will X be the FIRST to
+    # happen?" have correlated-but-distinct payoffs — directional risk, not
+    # arb. The signal is `neg_risk=True AND group_item_title!=""`; a true
+    # binary like "trump-out-as-president-before-2027" has neg_risk=False
+    # and empty groupItemTitle and is unaffected.
+    n_before = len(poly_markets)
+    poly_markets = [
+        p for p in poly_markets
+        if not (p.get("neg_risk") and p.get("group_item_title"))
+    ]
+    n_rejected = n_before - len(poly_markets)
+    if n_rejected:
+        log.info(
+            "Matcher: rejected %d Polymarket neg-risk sub-outcomes pre-match",
+            n_rejected,
+        )
+    if not poly_markets:
+        return []
+
     # Pre-compute normalised text once per market.
     k_texts = [_preprocess(k["question"]) for k in kalshi_markets]
     p_texts = [_preprocess(p["question"]) for p in poly_markets]
