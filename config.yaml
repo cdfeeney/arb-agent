@@ -73,42 +73,43 @@ llm:
                                # only NEW pairs hit the API; previously-verified ones return instantly from DB.
 
 filters:
-  min_volume: 500              # DIAGNOSTIC: temporarily lowered from 5000 to validate pipeline.
-                               # Empirical: top binary Kalshi market in 14d window had ~$1.4k vol.
-                               # Re-tighten to 5000 once we confirm verifier behavior on real pairs.
-  min_hours_to_close: 1        # DIAGNOSTIC: lowered from 24. We can't fill both legs on
-                               # a market closing in <1h, so 1h is a hard floor; 24h was
-                               # the pre-paper-trading conservative value. Re-tighten before
-                               # going live (recommended: 6h once execution latency is known).
-  max_days_to_close: 365       # Widened from 60 to 365 (2026-04-30): third-party arb tracker
-                               # showed 70%+ of available cross-platform arbs live in the
-                               # 180-921 day range (2026 elections, IPOs, year-end policy
-                               # bets). The 60-day window was systematically excluding the
-                               # bulk of the opportunity set. Watch for re-introduction of
-                               # the "unquoted long-dated markets" bug — if seen, narrow back.
-  min_profit_pct: 0.03         # 3% minimum gross edge. With Kalshi taker (0.07) + Polymarket
-                               # politics taker (0.04), entry-only fees ≈ 2.75% of stake at
-                               # P≈0.5. Holding to resolution: break-even ~2.75%. Anything
-                               # under 3% gross is negative-EV by design even before slippage
-                               # or partial-unwind exit fees. Bump to 0.04 if we ever stop
-                               # holding to resolution (entry+exit fees ≈ 5.5%).
+  # 2026-05-02 STRATEGY PIVOT — Sub-week velocity:
+  #   Old strategy: take any 3%+ edge on any time horizon, hold to resolution
+  #   New strategy: take only liquid, near-term opportunities; exit on
+  #                 convergence within days; redeploy capital. The old strategy
+  #                 was producing 43 tiny long-dated positions where fees ate
+  #                 the edge. New strategy concentrates on opportunities that
+  #                 can actually return capital fast.
+  min_volume: 5000             # was 500 — only liquid markets. Smart-money traders
+                               # arb these away within hours/days, giving us a
+                               # natural exit path. Illiquid markets sit dormant.
+  min_hours_to_close: 24       # was 1 — need time to fill both legs cleanly
+                               # AND for natural convergence to play out
+  max_days_to_close: 30        # was 365 — DON'T enter long-dated bets. They sit
+                               # for months waiting for resolution, locking
+                               # capital we could be recycling. Sub-week velocity
+                               # requires near-term resolution OR fast convergence.
+  min_profit_pct: 0.05         # was 0.03 — require enough gross edge to
+                               # comfortably clear round-trip fees (4-5% at
+                               # $10-20 stakes) with margin for slippage.
 
 sizing:
-  bankroll: 100                # total capital deployed across both platforms.
-                               # Paper-trading with $100 to mirror the real-life constraint
-                               # — sizing engine will reject opps that don't fit, and at
-                               # this bankroll we naturally favor higher-edge arbs.
-  max_position_pct: 0.10       # up to 10% of bankroll per opp = $10 max stake at $100 bankroll.
-                               # Bumped from 5% so we can actually deploy capital — at 5%
-                               # ($5 stake) Kalshi+Polymarket fees (~0.28) eat 5.6% of stake
-                               # which kills sub-5% arbs. $10 stakes get fees down to ~2.75%.
-  min_bet: 0.5                 # platform-side floor. With $100 bankroll and typical
-                               # cost_per_contract ~$0.94, $0.50 lets us enter positions of
-                               # 1 contract on Kalshi minimum + 1 on Polymarket — the natural
-                               # "minimum unit of arbitrage" — without padding to $1. Reduces
-                               # fee drag-as-fraction of stake; capture more diverse positions.
-  max_bet: 10                  # hard ceiling at 10% of $100 bankroll. Single arb can't
-                               # blow through more than this.
+  # 2026-05-02 STRATEGY PIVOT — concentrate on fewer, larger, liquid bets.
+  # Old: $0.50-$10 stakes spread across 43 positions → fees ate edge,
+  #      no maker spread capture, illiquid books = no maker fills.
+  # New: $8-$20 stakes on liquid markets only → fee % drops, maker spread
+  #      captures real $, liquid books fill makers within hours.
+  bankroll: 100                # back to $100 after archiving legacy positions
+                               # (2026-05-02 strategy pivot — clean fresh start).
+                               # See scripts/archive_legacy_paper_trades.py
+  max_position_pct: 0.10       # 10% of $200 bankroll = $20 max per opp.
+                               # Same effective max as before but with bigger
+                               # bankroll → more concurrent slots possible.
+  min_bet: 8                   # was 0.5 — won't take trades too small for fees.
+                               # At $8 stake, Kalshi ceil() 1¢ floor is 0.13%
+                               # of stake (vs 2% at $0.50). Fee math actually
+                               # works.
+  max_bet: 20                  # was 10 — allow concentration on top opps.
   kelly_fraction: 1.0          # full Kelly. Rationale: cross-platform arbs are near-deterministic
                                # (both sides hedge each other); the variance that justifies
                                # quarter-Kelly comes from leg-fill risk, which our naked-leg
@@ -125,13 +126,11 @@ sizing:
                                # exited at top-of-book. With 0.25, a market with $40 of
                                # bid depth → $10 entry per leg. The user's "$10 → $1 is
                                # fine" principle: small in shallow books, larger in deep.
-  min_bid_depth_usd: 20        # tier-1 profit-idea #2: reject thin sub-outcome arbs at
-                               # entry. Multi-outcome event UIs report parent-event
-                               # liquidity ($5k+) but a sub-outcome can have $5 of real
-                               # bid depth. With a $20 floor, the smallest entry our
-                               # 0.25 book_depth_fraction would allow is $5/leg ($10
-                               # total) — fits the $10 max_bet cleanly. Trades below
-                               # this floor are inherently unexitable on $100 bankroll.
+  min_bid_depth_usd: 80        # was 20 — re-tightened for new $20 max_bet strategy.
+                               # At $20 stake and 0.25 book_depth_fraction, we need
+                               # at least $80 of bid depth to satisfy the unwind path
+                               # without slippage. Below this, exits walk the book
+                               # and lose the maker-exit advantage.
 
 fees:
   # Both platforms charge ONLY the taker (the side hitting a resting order).
