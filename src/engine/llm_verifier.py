@@ -18,7 +18,7 @@ Mark is_match=TRUE when:
 
 Wording differences that DO NOT matter (still match):
 - "Will X win?" vs "Who will win? – X"
-- "X out by date Y?" vs "Will X be out before date Y+1?"
+- "X out by date Y?" vs "Will X be out before date Y+1?" (close-of-day Y resolves both)
 - "Will X receive the most votes?" vs "Who will win the primary? – X"
 - Verbose Kalshi rules vs Polymarket short questions, when the underlying event is identical.
 - Multi-outcome Kalshi event ("Who will IPO before 2027? – Kraken") matching a binary
@@ -34,22 +34,41 @@ Wording differences that DO NOT matter (still match):
   the question asks about.
 
 Mark is_match=FALSE when:
-- Different thresholds or time windows ("BTC > $100k by Dec 31" vs "BTC > $100k by Jan 31").
+- Different thresholds or time windows ("BTC > $100k by Dec 31" vs "BTC > $100k by Jan 31",
+  "Fed funds rate above 4.25% by July" vs "above 4.50% by July").
 - One is a strict sub-question of the other ("Fed cuts rates" vs "Who dissents at FOMC?").
 - Different resolution sources that could plausibly disagree on outcome.
 - The underlying events are genuinely different.
+- ★ EXCLUSIVE-RACE vs UNIVERSAL-BINARY mismatch. A "first/next/who-will" race outcome
+  resolves YES only when the named entity is the FIRST to do X (relative comparison
+  among the basket members). A binary "Will X do Y?" resolves YES whenever X does Y,
+  independent of others. These are NOT the same event.
+  Example of NO match: "Donald Trump out before 2027?" (universal binary, YES if Trump
+  leaves for any reason) vs "Will Donald Trump be the next leader out before 2027?"
+  (exclusive race, YES only if Trump is the FIRST among a basket of world leaders to
+  leave). Trump can leave second → first market YES, second market NO. Mark is_match=FALSE.
+- ★ DATE-BUCKET MISMATCH inside a parametric series. Markets like "Will [X] before
+  April 1?" vs "Will [X] before August 1?" are date-bucketed siblings, NOT the same
+  event. The shorter window is a proper subset of the longer.
 
 Calibration: false positives cost real money; false negatives leave money on the table.
 Both are bad. Lean toward MATCH when the resolution criterion is clearly the same despite
 different phrasing — your job is to spot semantic equivalence, not punish word variation.
+But the EXCLUSIVE-RACE vs UNIVERSAL-BINARY mismatch is a hard rule: if Polymarket's market
+is part of an exclusive basket (signaled below) and the Kalshi market is a standalone
+binary "Will X do Y?", mark FALSE regardless of question similarity.
 
 Market A (Kalshi):
   Question: {a_question}
   YES means: {a_yes_sub}
   NO means:  {a_no_sub}
+  Event ticker: {a_event_ticker}
 
 Market B (Polymarket):
   Question: {b_question}
+  Polymarket structural flags:
+    negRisk = {b_neg_risk}            (true = exclusive-basket sub-outcome)
+    groupItemTitle = "{b_group_item_title}"  (the sub-item label inside its basket)
 
 Respond with JSON only, no prose."""
 
@@ -91,7 +110,10 @@ class LLMVerifier:
             a_question=market_a.get("question", ""),
             a_yes_sub=market_a.get("yes_sub_title", "") or "(not specified)",
             a_no_sub=market_a.get("no_sub_title", "") or "(not specified)",
+            a_event_ticker=market_a.get("event_ticker", "") or "(unknown)",
             b_question=market_b.get("question", ""),
+            b_neg_risk=str(market_b.get("neg_risk", False)).lower(),
+            b_group_item_title=market_b.get("group_item_title", "") or "",
         )
 
         try:
