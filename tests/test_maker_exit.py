@@ -208,3 +208,116 @@ async def test_place_maker_exit_skips_if_already_resting(db):
     r2 = await _try_place_maker_exit(db, trade, mark, 5.0, cfg, summary)
     assert r2 is None
     assert summary["maker_placed"] == 1
+
+
+# --- Sprint 2c: live-path tests against a fake poly_exchange ---
+
+class _FakePolyExchange:
+    """Stand-in for PolymarketExchange. Records calls; returns scripted
+    PlaceResult / FillState. allow_send=True triggers the live code path
+    in _try_place_maker_exit / _handle_resting_maker."""
+    def __init__(self, allow_send=True, place_accept=True, place_error=None,
+                 next_external_id="POLY-LIVE-1"):
+        self.allow_send = allow_send
+        self.place_accept = place_accept
+        self.place_error = place_error
+        self.next_external_id = next_external_id
+        self.placed: list[dict] = []
+        self.cancels: list[str] = []
+
+    async def place_maker_sell(self, *, token, target_price, contracts, idempotency_key):
+        from src.exec.exchange import PlaceResult
+        self.placed.append({
+            "token": token, "target_price": target_price,
+            "contracts": contracts, "idempotency_key": idempotency_key,
+        })
+        if not self.place_accept:
+            return PlaceResult("", False, error=self.place_error or "rejected")
+        return PlaceResult(self.next_external_id, True)
+
+    async def cancel_order(self, external_order_id):
+        self.cancels.append(external_order_id)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_place_maker_exit_live_path_calls_exchange(db):
+    """When poly_exchange.allow_send=True, _try_place_maker_exit must POST
+    to the exchange and store the returned external_order_id."""
+    mark = _mark_with_legs(yes_platform="kalshi", no_platform="polymarket",
+                           no_bid=0.50)
+    # The trade row provides the CLOB token (saved at entry)
+    trade = {"id": 200, "no_token": "TOKEN-NO-200"}
+    summary = {"maker_placed": 0}
+    cfg = _FakeExitCfg(_MAKER_CFG)
+    fake_ex = _FakePolyExchange(allow_send=True, next_external_id="POLY-XYZ")
+    result = await _try_place_maker_exit(
+        db, trade, mark, unwind_size=5.0, cfg=cfg, summary=summary,
+        poly_exchange=fake_ex,
+    )
+    assert result is not None
+    assert "mode=live" in result
+    assert len(fake_ex.placed) == 1
+    placed = fake_ex.placed[0]
+    assert placed["token"] == "TOKEN-NO-200"
+    assert abs(placed["target_price"] - 0.51) < 1e-9
+    assert placed["contracts"] == 5.0
+    rows = await db.list_resting_maker_orders(paper_trade_id=200)
+    assert len(rows) == 1
+    assert rows[0]["external_order_id"] == "POLY-XYZ"
+    assert rows[0]["execution_mode"] == "live"
+
+
+@pytest.mark.asyncio
+async def test_place_maker_exit_skips_if_no_token(db):
+    """Live mode but trade has no CLOB token → cannot post real order. Skip."""
+    mark = _mark_with_legs(yes_platform="kalshi", no_platform="polymarket")
+    trade = {"id": 201}  # missing no_token
+    summary = {"maker_placed": 0}
+    cfg = _FakeExitCfg(_MAKER_CFG)
+    fake_ex = _FakePolyExchange(allow_send=True)
+    result = await _try_place_maker_exit(
+        db, trade, mark, 5.0, cfg, summary, poly_exchange=fake_ex,
+    )
+    assert result is None
+    assert summary["maker_placed"] == 0
+    assert len(fake_ex.placed) == 0
+
+
+@pytest.mark.asyncio
+async def test_place_maker_exit_exchange_reject_doesnt_record(db):
+    """Exchange rejects the order → don't write to DB. Caller falls
+    through to taker fallback."""
+    mark = _mark_with_legs(yes_platform="kalshi", no_platform="polymarket")
+    trade = {"id": 202, "no_token": "TOKEN-NO-202"}
+    summary = {"maker_placed": 0}
+    cfg = _FakeExitCfg(_MAKER_CFG)
+    fake_ex = _FakePolyExchange(
+        allow_send=True, place_accept=False, place_error="insufficient_balance",
+    )
+    result = await _try_place_maker_exit(
+        db, trade, mark, 5.0, cfg, summary, poly_exchange=fake_ex,
+    )
+    assert result is None
+    assert summary["maker_placed"] == 0
+    rows = await db.list_resting_maker_orders(paper_trade_id=202)
+    assert len(rows) == 0
+
+
+@pytest.mark.asyncio
+async def test_place_maker_exit_paper_path_when_allow_send_false(db):
+    """poly_exchange present but allow_send=False → simulate (no exchange call)."""
+    mark = _mark_with_legs(yes_platform="kalshi", no_platform="polymarket")
+    trade = {"id": 203, "no_token": "TOKEN-NO-203"}
+    summary = {"maker_placed": 0}
+    cfg = _FakeExitCfg(_MAKER_CFG)
+    fake_ex = _FakePolyExchange(allow_send=False)
+    result = await _try_place_maker_exit(
+        db, trade, mark, 5.0, cfg, summary, poly_exchange=fake_ex,
+    )
+    assert result is not None
+    assert "mode=paper" in result
+    assert len(fake_ex.placed) == 0  # no real call made
+    rows = await db.list_resting_maker_orders(paper_trade_id=203)
+    assert rows[0]["execution_mode"] == "paper"
+    assert rows[0]["external_order_id"] is None

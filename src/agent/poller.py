@@ -395,11 +395,19 @@ class PollingAgent:
         )
         while True:
             try:
+                # In live mode the poly exchange writer is registered on
+                # self.executor — pass it so the monitor can place real
+                # maker orders + poll real fills. In log_only mode this
+                # attribute is absent and monitor falls back to simulation.
+                poly_exchange = None
+                if hasattr(self.executor, "exchanges"):
+                    poly_exchange = self.executor.exchanges.get("polymarket")
                 mon = await position_monitor.monitor_open_positions(
                     self.db, self.kalshi, self.poly, self.exit_cfg,
                     dry_run=self.cfg.get("dry_run", True),
                     fee_cfg=self.cfg.get("fees", {}),
                     max_concurrent=max_concurrent,
+                    poly_exchange=poly_exchange,
                 )
                 if mon["n_open"] > 0:
                     log.info(

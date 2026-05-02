@@ -142,6 +142,63 @@ class PolymarketExchange:
         oid = resp.get("orderID") or resp.get("orderId") or ""
         return PlaceResult(external_order_id=oid, accepted=True)
 
+    async def place_maker_sell(
+        self,
+        *,
+        token: str,
+        target_price: float,
+        contracts: float,
+        idempotency_key: str,
+    ) -> PlaceResult:
+        """Rest a SELL limit order on Polymarket at target_price (GTC).
+
+        Maker order — captures the spread and pays 0% fee on Polymarket
+        when filled. Used by position_monitor's maker-exit path. Returns
+        a fake DRY id when allow_send=False so callers can record state
+        without spending money.
+        """
+        if not token:
+            return PlaceResult("", False, error="missing CLOB token")
+        if not self.allow_send:
+            fake = f"DRY-POLY-MAKER-{idempotency_key[:10]}"
+            log.warning(
+                "[POLY allow_send=False] would place GTC maker SELL "
+                "token=%s @$%.4f size=%g — returning fake id %s",
+                token[:16], target_price, contracts, fake,
+            )
+            return PlaceResult(external_order_id=fake, accepted=True)
+        try:
+            return await asyncio.to_thread(
+                self._place_maker_sync, token, target_price, contracts,
+            )
+        except Exception as e:
+            log.error(
+                "Polymarket place_maker_sell error: %s", e, exc_info=True,
+            )
+            return PlaceResult("", False, error=str(e))
+
+    def _place_maker_sync(
+        self, token: str, target_price: float, contracts: float,
+    ) -> PlaceResult:
+        clob = self._ensure_client()
+        OrderArgs = self._import["OrderArgs"]
+        OrderType = self._import["OrderType"]
+        SELL = self._import["SELL"]
+        args = OrderArgs(
+            price=float(target_price),
+            size=float(contracts),
+            side=SELL,
+            token_id=token,
+        )
+        # GTC = Good-Till-Cancelled. The order rests on the book until
+        # filled or cancelled. This is the maker workflow.
+        resp = clob.create_and_post_order(args, order_type=OrderType.GTC)
+        if not (resp or {}).get("success"):
+            err = (resp or {}).get("errorMsg") or "create_and_post_order failed"
+            return PlaceResult("", False, error=err)
+        oid = resp.get("orderID") or resp.get("orderId") or ""
+        return PlaceResult(external_order_id=oid, accepted=True)
+
     async def get_order(self, external_order_id: str) -> FillState:
         if external_order_id.startswith("DRY-POLY-"):
             return FillState("filled", 0.0, 0.0)

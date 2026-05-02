@@ -369,14 +369,22 @@ async def _try_place_maker_exit(
     unwind_size: float,
     cfg: ExitConfig,
     summary: dict,
+    poly_exchange=None,
 ) -> str | None:
     """Place a maker sell-limit on the Polymarket leg at best_bid + spread.
+
+    If `poly_exchange` is provided AND its allow_send is True, actually POST
+    a GTC sell-limit to Polymarket and record the external_order_id.
+    Otherwise simulate (paper mode): just record the intent in the DB and
+    let _handle_resting_maker check fills via best_bid comparison.
+
     Returns the decision-reason string on success, or None to fall through
-    to the normal taker partial-unwind path."""
+    to the normal taker partial-unwind path.
+    """
     poly_info = _polymarket_leg(mark)
     if poly_info is None:
         return None  # no poly leg → no maker advantage
-    poly_leg_name, _poly_market, poly_leg_mark = poly_info
+    poly_leg_name, poly_market, poly_leg_mark = poly_info
     if poly_leg_mark.best_bid <= 0:
         return None  # need a bid to compute target_price
     target_price = round(
@@ -389,23 +397,56 @@ async def _try_place_maker_exit(
     existing = await db.list_resting_maker_orders(int(trade["id"]))
     if existing:
         return None
+
+    # Live path: actually POST the maker sell to Polymarket. We need the
+    # CLOB token id for this leg, which is on the original trade row (saved
+    # at entry time as yes_token / no_token).
+    external_id: str | None = None
+    execution_mode = "paper"
+    if poly_exchange is not None and getattr(poly_exchange, "allow_send", False):
+        token_field = "yes_token" if poly_leg_name == "yes" else "no_token"
+        token = trade.get(token_field) or poly_market.get(token_field) or ""
+        if not token:
+            log.warning(
+                "MAKER_PLACED skipped trade #%d: no %s on trade record — "
+                "can't place real Polymarket order",
+                trade["id"], token_field,
+            )
+            return None
+        idemp = f"maker-{trade['id']}-{int(target_price * 10000)}"
+        result = await poly_exchange.place_maker_sell(
+            token=token, target_price=target_price,
+            contracts=unwind_size, idempotency_key=idemp,
+        )
+        if not result.accepted:
+            log.error(
+                "MAKER_PLACED failed trade #%d: poly exchange rejected — %s",
+                trade["id"], result.error,
+            )
+            return None
+        external_id = result.external_order_id
+        execution_mode = "live"
+
     order_id = await db.record_maker_order(
         paper_trade_id=int(trade["id"]),
         leg=poly_leg_name,
         platform="polymarket",
         target_price=target_price,
         contracts=unwind_size,
+        external_order_id=external_id,
+        execution_mode=execution_mode,
     )
     summary["maker_placed"] += 1
     log.info(
-        "MAKER_PLACED trade #%d: rest %s leg @$%.4f for %.2f contracts "
-        "(poly bid now=%.4f + spread=%.4f) order #%d",
-        trade["id"], poly_leg_name, target_price, unwind_size,
+        "MAKER_PLACED trade #%d [%s]: rest %s leg @$%.4f for %.2f contracts "
+        "(poly bid now=%.4f + spread=%.4f) order #%d ext=%s",
+        trade["id"], execution_mode, poly_leg_name, target_price, unwind_size,
         poly_leg_mark.best_bid, cfg.maker_exit.spread_above_bid, order_id,
+        external_id or "(sim)",
     )
     return (
         f"maker rest: {poly_leg_name} leg target=${target_price:.4f} "
-        f"size={unwind_size:.2f} (waiting for poly bid to reach target)"
+        f"size={unwind_size:.2f} mode={execution_mode}"
     )
 
 
@@ -418,8 +459,13 @@ async def _handle_resting_maker(
     fee_cfg: dict | None,
     summary: dict,
     dry_run: bool,
+    poly_exchange=None,
 ) -> str:
     """Decide what to do with a resting maker order.
+
+    In live mode (order has external_order_id + poly_exchange + allow_send):
+    poll the actual exchange for fill status. Otherwise: simulate by
+    comparing target_price against current best_bid.
 
     Returns:
         "filled"    — atomic fill applied + mark written; skip _decide
@@ -431,6 +477,13 @@ async def _handle_resting_maker(
     target_price = float(order["target_price"])
     contracts = float(order["contracts"])
     leg_name = order["leg"]
+    external_id = order.get("external_order_id")
+    is_live = (
+        bool(external_id)
+        and not str(external_id).startswith("DRY-")
+        and poly_exchange is not None
+        and getattr(poly_exchange, "allow_send", False)
+    )
 
     # Identify the polymarket leg's current bid + the OTHER leg (which we'd
     # taker-sell on fill). Order's `leg` tells us which side maker rests on.
@@ -445,19 +498,45 @@ async def _handle_resting_maker(
         other_market = mark.buy_yes
         other_leg_name = "yes"
 
-    # Fill check: if the polymarket-leg best_bid has moved up to or past
-    # our target_price, a buyer would have crossed our resting ask.
-    poly_bid = poly_leg_mark.best_bid
-    fill_now = (
-        poly_leg_mark.book_available
-        and poly_bid > 0
-        and poly_bid >= target_price
-        and other_leg_mark.book_available
-        and other_leg_mark.best_bid > 0
-    )
-
     age_seconds = _maker_order_age_seconds(placed_at)
     aged_out = age_seconds is not None and age_seconds >= cfg.maker_exit.max_age_seconds
+
+    # Fill check. Live: query the exchange. Simulated: compare bid to target.
+    if is_live:
+        live_state = await poly_exchange.get_order(external_id)
+        if live_state.status in ("filled", "partial"):
+            actual_fill_price = live_state.avg_fill_price or target_price
+            actual_filled = live_state.filled_contracts or contracts
+            # We need the OTHER leg's book to be available for taker-sell.
+            fill_now = other_leg_mark.book_available and other_leg_mark.best_bid > 0
+            if fill_now:
+                target_price = actual_fill_price  # use real fill price
+                contracts = actual_filled
+        elif live_state.status in ("cancelled", "failed"):
+            # Exchange already cancelled it for us (or it errored). Mark our
+            # row cancelled and fall through to taker.
+            await db.mark_maker_cancelled(
+                int(order["id"]),
+                reason=f"exchange_state={live_state.status}",
+            )
+            summary["maker_cancelled"] += 1
+            log.info(
+                "MAKER_CANCELLED trade #%d [live]: order #%d state=%s — "
+                "falling back to taker decision",
+                trade["id"], order["id"], live_state.status,
+            )
+            return "cancelled"
+        else:
+            fill_now = False
+    else:
+        poly_bid = poly_leg_mark.best_bid
+        fill_now = (
+            poly_leg_mark.book_available
+            and poly_bid > 0
+            and poly_bid >= target_price
+            and other_leg_mark.book_available
+            and other_leg_mark.best_bid > 0
+        )
 
     if fill_now:
         # Atomic fill: poly leg fills at target_price (no fee), other leg
@@ -512,15 +591,31 @@ async def _handle_resting_maker(
         return "filled"
 
     if aged_out:
+        # Live: cancel on the exchange first, then mark our row cancelled.
+        # If the exchange cancel fails, still mark cancelled so we don't
+        # spin on this order forever — the next monitor cycle will see the
+        # exchange-side state if it's still resting somewhere.
+        if is_live:
+            try:
+                ok = await poly_exchange.cancel_order(external_id)
+                if not ok:
+                    log.warning(
+                        "MAKER cancel returned False for live order %s; "
+                        "still marking row cancelled",
+                        external_id,
+                    )
+            except Exception as e:
+                log.error("MAKER cancel error for %s: %s", external_id, e)
         await db.mark_maker_cancelled(
             int(order["id"]),
             reason=f"aged_out:{age_seconds:.0f}s>{cfg.maker_exit.max_age_seconds:.0f}s",
         )
         summary["maker_cancelled"] += 1
         log.info(
-            "MAKER_CANCELLED trade #%d: order #%d aged %0.0fs > max %.0fs — "
+            "MAKER_CANCELLED trade #%d [%s]: order #%d aged %0.0fs > max %.0fs — "
             "falling back to taker decision",
-            trade["id"], order["id"], age_seconds, cfg.maker_exit.max_age_seconds,
+            trade["id"], "live" if is_live else "paper", order["id"],
+            age_seconds, cfg.maker_exit.max_age_seconds,
         )
         return "cancelled"
 
@@ -586,6 +681,7 @@ async def monitor_open_positions(
     dry_run: bool = True,
     fee_cfg: dict | None = None,
     max_concurrent: int = 8,
+    poly_exchange=None,
 ) -> dict:
     """Mark-to-market every open paper trade. Returns summary for logging.
 
@@ -664,6 +760,7 @@ async def monitor_open_positions(
             if existing:
                 outcome = await _handle_resting_maker(
                     db, trade, mark, existing[0], cfg, fee_cfg, summary, dry_run,
+                    poly_exchange=poly_exchange,
                 )
                 if outcome in ("filled", "resting"):
                     # Either we already wrote a mark + applied unwind (filled)
@@ -687,6 +784,7 @@ async def monitor_open_positions(
             ):
                 placed = await _try_place_maker_exit(
                     db, trade, mark, unwind_size, cfg, summary,
+                    poly_exchange=poly_exchange,
                 )
                 if placed is not None:
                     # Override decision so the persisted mark reflects what

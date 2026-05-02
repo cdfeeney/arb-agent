@@ -253,12 +253,24 @@ class Database:
                     fill_price          REAL,
                     realized_gross_usd  REAL,
                     cancelled_at        TIMESTAMP,
-                    cancel_reason       TEXT
+                    cancel_reason       TEXT,
+                    external_order_id   TEXT,                      -- Polymarket order id when allow_send=true; NULL in paper mode
+                    execution_mode      TEXT DEFAULT 'paper'       -- paper | live
                 )
             """)
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_maker_paper "
                 "ON maker_exit_orders(paper_trade_id, status)"
+            )
+            # Sprint 2c migration: add external_order_id + execution_mode
+            # columns for live-mode tracking. Idempotent — _maybe_add_column
+            # PRAGMAs first so re-running on existing DBs is safe.
+            await self._maybe_add_column(
+                db, "maker_exit_orders", "external_order_id", "TEXT",
+            )
+            await self._maybe_add_column(
+                db, "maker_exit_orders", "execution_mode",
+                "TEXT DEFAULT 'paper'",
             )
 
             # Migration: older paper_trades rows were saved before we captured
@@ -752,14 +764,18 @@ class Database:
         platform: str,
         target_price: float,
         contracts: float,
+        external_order_id: str | None = None,
+        execution_mode: str = "paper",
     ) -> int:
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
                 """INSERT INTO maker_exit_orders (
-                    paper_trade_id, leg, platform, target_price, contracts
-                ) VALUES (?,?,?,?,?)""",
+                    paper_trade_id, leg, platform, target_price, contracts,
+                    external_order_id, execution_mode
+                ) VALUES (?,?,?,?,?,?,?)""",
                 (paper_trade_id, leg, platform,
-                 round(float(target_price), 4), round(float(contracts), 4)),
+                 round(float(target_price), 4), round(float(contracts), 4),
+                 external_order_id, execution_mode),
             )
             await db.commit()
             return cur.lastrowid
