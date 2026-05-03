@@ -96,6 +96,22 @@ class PollingAgent:
 
     async def run(self):
         await init_orders_schema(self.cfg["database"]["path"])
+        # Reconcile any non-terminal orders against the exchanges before
+        # placing new ones. Skipped in non-live modes (no exchanges
+        # registered, no live state to drift from).
+        if self.exec_mode == "live":
+            from src.exec.reconciler import reconcile_open_orders
+            report = await reconcile_open_orders(
+                db_path=self.cfg["database"]["path"],
+                exchanges=self.executor.exchanges,
+            )
+            log.info("startup reconcile: %s", report.summary())
+            if report.halts_triggered > 0:
+                log.critical(
+                    "startup reconcile triggered %d halt(s) — STOP file written, "
+                    "bot will refuse new sends until manually cleared",
+                    report.halts_triggered,
+                )
         mode = "DRY RUN" if self.cfg.get("dry_run") else "LIVE"
         log.info(
             "Arb agent started [%s, executor=%s, allow_send=%s] — polling every %ds",
