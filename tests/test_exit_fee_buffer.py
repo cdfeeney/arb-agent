@@ -113,19 +113,21 @@ def test_trade_379_scenario_holds_with_buffer():
     assert "exit_fees" in reason
 
 
-def test_trade_379_scenario_old_behavior_with_buffer_zero():
-    """With buffer=0 (legacy), trade #379 still fires PARTIAL_UNWIND. This
-    proves the fix is gated by the new config knob and we haven't changed
-    behavior for users who explicitly disable it."""
+def test_trade_379_scenario_buffer_zero_still_holds_via_hold_gate():
+    """Even with buffer=0, the hold-vs-exit gate (added 2026-05-03) blocks
+    this exit because sum_bids 0.97 ≤ 1.0 + exit_fee/c — holding to
+    resolution captures more. Previously this fired PARTIAL_UNWIND under
+    buffer=0; the hold gate is independent of the buffer and strictly
+    safer."""
     mark = _mark(
         cost_per_contract=0.94,
         yes_bid=0.28, yes_size=10, yes_platform="kalshi", yes_paid=0.29,
         no_bid=0.69, no_size=10, no_platform="polymarket", no_paid=0.65,
         contracts_remaining=5.11,
     )
-    action, _, size = _decide(mark, _cfg(min_capture_above_fees=0.0), _FEE_CFG)
-    assert action == "PARTIAL_UNWIND"
-    assert size == pytest.approx(5.11)
+    action, reason, _ = _decide(mark, _cfg(min_capture_above_fees=0.0), _FEE_CFG)
+    assert action == "WATCH", f"got {action}: {reason}"
+    assert "hold-threshold" in reason or "exit_fees" in reason
 
 
 def test_strong_convergence_still_fires_with_buffer():
@@ -149,14 +151,58 @@ def test_strong_convergence_still_fires_with_buffer():
 
 
 def test_buffer_at_exact_threshold_passes():
-    """Edge case: net_realized exactly equals buffer × exit_fees → fire."""
-    # Construct with fee_cfg=None so exit_fees=0 → required=0 → any positive net fires
+    """Edge case: net_realized exactly equals buffer × exit_fees → fire.
+    Uses sum_bids > 1.0 so the hold-vs-exit gate also passes."""
+    # sum_bids = 1.06 > 1.0, gross_per = 1.06 - 0.94 = 0.12
     mark = _mark(
         cost_per_contract=0.94,
-        yes_bid=0.30, yes_size=10, yes_platform="kalshi", yes_paid=0.29,
+        yes_bid=0.40, yes_size=10, yes_platform="kalshi", yes_paid=0.29,
         no_bid=0.66, no_size=10, no_platform="polymarket", no_paid=0.65,
         contracts_remaining=2.0,
     )
-    # With fee_cfg=None, exit_fees=0, so any positive net passes the gate.
+    # With fee_cfg=None, exit_fees=0, so any positive net passes the buffer
+    # gate AND sum_bids > 1.0 passes the hold-vs-exit gate.
     action, _, _ = _decide(mark, _cfg(), fee_cfg=None)
     assert action == "PARTIAL_UNWIND"
+
+
+def test_hold_vs_exit_gate_holds_when_sum_bids_below_one():
+    """sum_bids ≤ 1.0 → hold to resolution dominates exiting now."""
+    # sum = 0.30 + 0.69 = 0.99, below 1.0 + any positive exit_fee_per_contract
+    mark = _mark(
+        cost_per_contract=0.85,
+        yes_bid=0.30, yes_size=10, yes_platform="kalshi", yes_paid=0.40,
+        no_bid=0.69, no_size=10, no_platform="polymarket", no_paid=0.50,
+        contracts_remaining=5.0,
+    )
+    action, reason, _ = _decide(mark, _cfg(min_capture_above_fees=0.0), _FEE_CFG)
+    assert action == "WATCH"
+    assert "hold-threshold" in reason
+
+
+def test_hold_vs_exit_gate_fires_when_sum_bids_above_one():
+    """sum_bids comfortably above 1.0 + exit_fee/c → exit captures real profit."""
+    # sum = 0.45 + 0.70 = 1.15 — solidly above 1.0
+    mark = _mark(
+        cost_per_contract=0.85,
+        yes_bid=0.45, yes_size=10, yes_platform="kalshi", yes_paid=0.40,
+        no_bid=0.70, no_size=10, no_platform="polymarket", no_paid=0.50,
+        contracts_remaining=5.0,
+    )
+    action, reason, _ = _decide(mark, _cfg(), _FEE_CFG)
+    assert action == "PARTIAL_UNWIND", f"got {action}: {reason}"
+
+
+def test_kashkari_398_scenario_now_holds():
+    """Direct regression for trades 398-402: sum_bids 0.98 must HOLD,
+    not exit. This is the bug the user surfaced 2026-05-03."""
+    # Kashkari pair at fill: yes 0.16, no 0.82 → sum 0.98, cost 0.92
+    mark = _mark(
+        cost_per_contract=0.92,
+        yes_bid=0.16, yes_size=20, yes_platform="polymarket", yes_paid=0.12,
+        no_bid=0.82, no_size=20, no_platform="kalshi", no_paid=0.80,
+        contracts_remaining=9.0,
+    )
+    action, reason, _ = _decide(mark, _cfg(), _FEE_CFG)
+    assert action == "WATCH", f"got {action}: {reason}"
+    assert "hold-threshold" in reason
