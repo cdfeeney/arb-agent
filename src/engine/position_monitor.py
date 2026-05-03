@@ -24,7 +24,7 @@ from typing import Optional
 from src.clients.kalshi import KalshiClient
 from src.clients.polymarket import PolymarketClient
 from src.db.store import Database
-from src.engine.fees import compute_unwind_fees
+from src.engine.fees import compute_unwind_fees, kalshi_taker_fee
 
 log = logging.getLogger(__name__)
 
@@ -557,18 +557,30 @@ async def _handle_resting_maker(
         )
 
     if fill_now:
-        # Atomic fill: poly leg fills at target_price (no fee), other leg
-        # taker-sold at current best_bid (pays its taker fee).
-        kalshi_fee_rate = float((fee_cfg or {}).get("kalshi_fee_rate", 0.07))
-        kalshi_taker_fee = (
-            kalshi_fee_rate * contracts * other_leg_mark.best_bid
+        # Atomic fill: poly leg fills at target_price (no fee, Polymarket
+        # makers pay 0%), other leg taker-sold at current best_bid (pays
+        # its real taker fee).
+        #
+        # Bug fixed 2026-05-03: this block previously inlined the Kalshi
+        # fee as `rate × contracts × price`, dropping the (1-price) factor
+        # and the cent-ceiling. For lopsided arb pairs where one leg sits
+        # near $0.80–0.90, that overstated fees ~5×, turning real-money
+        # winners into phantom paper losses (e.g. Kashkari pair trades
+        # 398–402 each booked -$0.13 on what was actually +$0.28).
+        # Use the canonical kalshi_taker_fee() from fees.py instead.
+        exit_fee = (
+            kalshi_taker_fee(
+                contracts,
+                other_leg_mark.best_bid,
+                float((fee_cfg or {}).get("kalshi_fee_rate", 0.07)),
+            )
             if (other_market or {}).get("platform") == "kalshi" else 0.0
         )
         gross_per_contract = (
             target_price + other_leg_mark.best_bid - mark.cost_per_contract
         )
         gross_realized = gross_per_contract * contracts
-        net_realized = round(gross_realized - kalshi_taker_fee, 4)
+        net_realized = round(gross_realized - exit_fee, 4)
         await db.mark_maker_filled(
             int(order["id"]),
             fill_price=target_price,
