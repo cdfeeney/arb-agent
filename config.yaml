@@ -89,9 +89,16 @@ filters:
                                # for months waiting for resolution, locking
                                # capital we could be recycling. Sub-week velocity
                                # requires near-term resolution OR fast convergence.
-  min_profit_pct: 0.05         # was 0.03 — require enough gross edge to
-                               # comfortably clear round-trip fees (4-5% at
-                               # $10-20 stakes) with margin for slippage.
+  min_profit_pct: 0.04         # 2026-05-03: lowered from 0.05 after the
+                               # maker-exit Kalshi fee bug (commit 94c8bd5)
+                               # was fixed. The buggy formula overstated
+                               # fees ~5× on lopsided arb pairs, so the old
+                               # 5% floor effectively required ~10% real
+                               # edge to be profitable. With correct fees,
+                               # 4% × 9 contracts = $0.36 gross − ~$0.26
+                               # round-trip fees = $0.10 net, comfortably
+                               # positive. Try 0.03 once we have ≥30 closed
+                               # trades to confirm the model.
 
 sizing:
   # 2026-05-02 STRATEGY PIVOT — concentrate on fewer, larger, liquid bets.
