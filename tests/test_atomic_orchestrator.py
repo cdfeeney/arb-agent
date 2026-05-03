@@ -193,6 +193,90 @@ async def test_both_rejected_at_place(db_path):
 
 
 @pytest.mark.asyncio
+async def test_partial_fill_both_legs_full_size_succeeds(db_path):
+    """Both legs report status='partial' but at the same fill_fraction —
+    the hedge is intact at the partial size; no residual to unwind. The
+    bug pre-fix: orchestrator polled forever waiting for status=='filled'
+    and timed out on a perfectly hedged position."""
+    opp, sizing = _make_opp_sizing(contracts=10.0)
+    plan = build_entry_plan(opp, sizing, paper_trade_id=10)
+    exchanges = {
+        "kalshi": SimulatedExchange(
+            "kalshi", SimSpec(fill_status="partial", fill_fraction=0.7),
+        ),
+        "polymarket": SimulatedExchange(
+            "polymarket", SimSpec(fill_status="partial", fill_fraction=0.7),
+        ),
+    }
+    result = await execute_atomic_entry(
+        plan=plan, exchanges=exchanges, db_path=db_path,
+        naked_leg_timeout_seconds=0.5, per_leg_timeout_seconds=2.0,
+        poll_interval_seconds=0.05,
+    )
+    # Both legs at 7.0 contracts each → fully hedged at 7, no residual
+    assert result.success is True, f"got error: {result.error}"
+    assert result.leg_yes.status == "partial"
+    assert result.leg_no.status == "partial"
+    assert result.leg_yes.filled_contracts == 7.0
+    assert result.leg_no.filled_contracts == 7.0
+    assert result.naked_leg_unwound is False  # nothing to unwind
+    assert result.naked_leg_realized_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_unequal_unwinds_residual(db_path):
+    """yes leg fills 100%, no leg fills 50% → residual on yes side must
+    be market-sold to flatten naked exposure."""
+    opp, sizing = _make_opp_sizing(contracts=10.0)
+    plan = build_entry_plan(opp, sizing, paper_trade_id=11)
+    exchanges = {
+        "kalshi": SimulatedExchange("kalshi", SimSpec(fill_status="filled")),
+        "polymarket": SimulatedExchange(
+            "polymarket",
+            SimSpec(fill_status="partial", fill_fraction=0.5,
+                    market_sell_price_per_contract=0.30),
+        ),
+    }
+    result = await execute_atomic_entry(
+        plan=plan, exchanges=exchanges, db_path=db_path,
+        naked_leg_timeout_seconds=0.5, per_leg_timeout_seconds=2.0,
+        poll_interval_seconds=0.05,
+    )
+    # yes filled 10, no filled 5 → hedge 5, residual 5 on yes side
+    assert result.leg_yes.filled_contracts == 10.0
+    assert result.leg_no.filled_contracts == 5.0
+    assert result.naked_leg_unwound is True, f"error: {result.error}"
+    assert result.success is True  # residual was unwound cleanly
+    assert "partial_hedge" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_one_below_min_residual_treated_as_naked(db_path):
+    """yes leg fills 100%, no leg fills 0.1 contracts (below 0.5
+    MIN_RESIDUAL) → no leg is treated as having no real fill; naked-leg
+    defense fires on the yes side."""
+    opp, sizing = _make_opp_sizing(contracts=10.0)
+    plan = build_entry_plan(opp, sizing, paper_trade_id=12)
+    exchanges = {
+        "kalshi": SimulatedExchange("kalshi", SimSpec(fill_status="filled")),
+        "polymarket": SimulatedExchange(
+            "polymarket",
+            SimSpec(fill_status="partial", fill_fraction=0.01,  # 0.1c on 10c
+                    market_sell_price_per_contract=0.30),
+        ),
+    }
+    result = await execute_atomic_entry(
+        plan=plan, exchanges=exchanges, db_path=db_path,
+        naked_leg_timeout_seconds=0.5, per_leg_timeout_seconds=2.0,
+        poll_interval_seconds=0.05,
+    )
+    # yes filled 10, no filled 0.1 (treated as zero) → naked leg
+    assert result.success is False
+    assert result.naked_leg_unwound is True
+    assert result.leg_yes.status == "filled"
+
+
+@pytest.mark.asyncio
 async def test_idempotency_retry_does_not_duplicate(db_path):
     """Calling execute_atomic_entry twice with the same plan within the
     same ms-bucket should not produce duplicate orders rows — the unique

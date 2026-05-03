@@ -34,11 +34,42 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from datetime import datetime, timezone
+from pathlib import Path
+
 from . import order_state
 from .base import EntryPlan, EntryResult, LegResult
 from .exchange import Exchange, FillState
+from .safety import create_stop_file
 
 log = logging.getLogger(__name__)
+
+# Anchor to repo root, mirroring safety.py's DEFAULT_STOP_FILE pattern, so
+# the alert log lives next to the STOP file regardless of cwd.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+CRITICAL_ALERTS_LOG = _REPO_ROOT / "data" / "CRITICAL_ALERTS.log"
+
+# A leg with this little residual after the IOC settles is treated as fully
+# matched — paying the hedged amount and abandoning a tiny stub avoids
+# thrashing the book on dust. Polymarket fractional contracts can leave
+# rounding noise; Kalshi is integer so any value < 1 means zero. 0.5 is
+# half a contract on either venue — well below any size we'd actually trade.
+MIN_RESIDUAL_CONTRACTS = 0.5
+
+
+def _is_terminal(state: FillState) -> bool:
+    """Order has reached a final state — fill quantity won't change.
+
+    Polymarket IOC orders land in 'partial' when book depth was insufficient;
+    that is a TERMINAL state for the order, not a 'still resting' one. We
+    must treat partial as a real fill at filled_contracts.
+    """
+    return state.status in ("filled", "partial", "cancelled", "failed")
+
+
+def _has_real_fills(state: FillState) -> bool:
+    """Order executed enough contracts to count as a fill (vs noise)."""
+    return state.filled_contracts >= MIN_RESIDUAL_CONTRACTS
 
 
 async def execute_atomic_entry(
@@ -175,46 +206,51 @@ async def execute_atomic_entry(
             no_ex.get_order(no_place.external_order_id),
         )
         now = loop.time()
-        if yes_state.status == "filled" and yes_filled_at is None:
+        # Track first-fill time off filled_contracts so partial fills also
+        # arm the naked-leg timer. Status string can lag the real fill.
+        if _has_real_fills(yes_state) and yes_filled_at is None:
             yes_filled_at = now
-        if no_state.status == "filled" and no_filled_at is None:
+        if _has_real_fills(no_state) and no_filled_at is None:
             no_filled_at = now
 
-        if yes_state.status == "filled" and no_state.status == "filled":
-            await order_state.update_status(
-                db_path, yes_id, status="filled",
-                filled_contracts=yes_state.filled_contracts,
-                avg_fill_price=yes_state.avg_fill_price,
-            )
-            await order_state.update_status(
-                db_path, no_id, status="filled",
-                filled_contracts=no_state.filled_contracts,
-                avg_fill_price=no_state.avg_fill_price,
-            )
-            log.info(
-                "Atomic entry corr=%s: both legs filled — yes %.2g@%.4f "
-                "no %.2g@%.4f",
-                plan.correlation_id,
-                yes_state.filled_contracts, yes_state.avg_fill_price,
-                no_state.filled_contracts, no_state.avg_fill_price,
-            )
-            return EntryResult(
-                plan=plan,
-                leg_yes=LegResult(
-                    plan.leg_yes, "filled",
-                    yes_state.filled_contracts, yes_state.avg_fill_price,
-                    external_order_id=yes_place.external_order_id,
-                ),
-                leg_no=LegResult(
-                    plan.leg_no, "filled",
-                    no_state.filled_contracts, no_state.avg_fill_price,
-                    external_order_id=no_place.external_order_id,
-                ),
-                success=True,
-            )
+        # Both legs reached terminal state (filled / partial / cancelled /
+        # failed). Branch on the actual fill quantities, not status strings:
+        # partial is a real fill that just stopped short of the requested
+        # size, and our hedge is min(yes_filled, no_filled).
+        if _is_terminal(yes_state) and _is_terminal(no_state):
+            yes_filled = yes_state.filled_contracts
+            no_filled = no_state.filled_contracts
+            yes_has = _has_real_fills(yes_state)
+            no_has = _has_real_fills(no_state)
 
-        # Naked-leg trigger: one filled, the other not, and the budget since
-        # the first fill is exhausted.
+            if yes_has and no_has:
+                return await _settle_with_residual(
+                    plan=plan,
+                    yes_ex=yes_ex, no_ex=no_ex,
+                    yes_id=yes_id, no_id=no_id,
+                    yes_place=yes_place, no_place=no_place,
+                    yes_state=yes_state, no_state=no_state,
+                    db_path=db_path,
+                )
+            if yes_has != no_has:
+                # One side has real fills, other terminal-with-zero
+                # (cancelled/failed/partial-below-MIN). Defend the filled
+                # side immediately — waiting for naked timeout when we
+                # already know the other side won't fill is pure exposure.
+                return await _defend_naked_leg(
+                    plan=plan,
+                    yes_ex=yes_ex, no_ex=no_ex,
+                    yes_id=yes_id, no_id=no_id,
+                    yes_place=yes_place, no_place=no_place,
+                    yes_state=yes_state, no_state=no_state,
+                    db_path=db_path,
+                )
+            # Both terminal, neither filled — both cancelled/failed.
+            # Fall through to per-leg-timeout cleanup.
+            break
+
+        # Naked-leg trigger: one side has real fills, the other is still
+        # resting (not terminal yet). After naked timeout, defend.
         first_filled_at = yes_filled_at if yes_filled_at is not None else no_filled_at
         if first_filled_at is not None and now - first_filled_at >= naked_leg_timeout_seconds:
             return await _defend_naked_leg(
@@ -256,6 +292,108 @@ async def execute_atomic_entry(
                          external_order_id=no_place.external_order_id),
         success=False,
         error="per_leg_timeout — neither leg filled in budget",
+    )
+
+
+async def _settle_with_residual(
+    *,
+    plan: EntryPlan,
+    yes_ex: Exchange,
+    no_ex: Exchange,
+    yes_id: int,
+    no_id: int,
+    yes_place,
+    no_place,
+    yes_state: FillState,
+    no_state: FillState,
+    db_path: str,
+) -> EntryResult:
+    """Both legs have real fills. Hedged amount is min(yes, no); any excess
+    on the overfilled side is naked exposure that must be unwound.
+
+    Common case: both fully filled (residual = 0) — straight success path.
+    Partial case: e.g. yes=5, no=4.7 → hedge 4.7, market-sell 0.3 from yes.
+    """
+    yes_filled = yes_state.filled_contracts
+    no_filled = no_state.filled_contracts
+    hedged = min(yes_filled, no_filled)
+    residual = abs(yes_filled - no_filled)
+
+    # Persist whatever-actually-filled, using the real status (filled vs
+    # partial) so post-mortem can tell which leg fell short.
+    await order_state.update_status(
+        db_path, yes_id, status=yes_state.status,
+        filled_contracts=yes_filled, avg_fill_price=yes_state.avg_fill_price,
+    )
+    await order_state.update_status(
+        db_path, no_id, status=no_state.status,
+        filled_contracts=no_filled, avg_fill_price=no_state.avg_fill_price,
+    )
+
+    residual_realized = 0.0
+    residual_unwound = True
+    if residual >= MIN_RESIDUAL_CONTRACTS:
+        # Overfilled side has unhedged contracts. Market-sell them on the
+        # overfilled venue to flatten exposure on that side.
+        if yes_filled > no_filled:
+            over_ex, over_plan, over_label = yes_ex, plan.leg_yes, "yes"
+        else:
+            over_ex, over_plan, over_label = no_ex, plan.leg_no, "no"
+        log.warning(
+            "Atomic entry corr=%s: PARTIAL HEDGE — yes=%.2f no=%.2f, "
+            "hedged=%.2f, unwinding %.2f from %s leg",
+            plan.correlation_id, yes_filled, no_filled, hedged, residual, over_label,
+        )
+        try:
+            sell = await over_ex.market_sell(over_plan, residual)
+            residual_realized = sell.realized_usd - residual * (
+                yes_state.avg_fill_price if over_label == "yes"
+                else no_state.avg_fill_price
+            )
+        except Exception as e:
+            log.error(
+                "Atomic entry corr=%s: residual unwind FAILED on %s leg: %s "
+                "— %.2f contracts still naked. Manual unwind required.",
+                plan.correlation_id, over_label, e, residual,
+            )
+            residual_unwound = False
+            await _emergency_halt(
+                db_path,
+                reason=(
+                    f"residual_unwind_failed corr={plan.correlation_id} "
+                    f"leg={over_label} contracts={residual:.2f} err={e}"
+                ),
+            )
+    else:
+        log.info(
+            "Atomic entry corr=%s: both legs filled — yes %.2f@%.4f no %.2f@%.4f "
+            "(residual %.4f below %.2f, ignored)",
+            plan.correlation_id, yes_filled, yes_state.avg_fill_price,
+            no_filled, no_state.avg_fill_price, residual, MIN_RESIDUAL_CONTRACTS,
+        )
+
+    return EntryResult(
+        plan=plan,
+        leg_yes=LegResult(
+            plan.leg_yes,
+            yes_state.status,
+            yes_filled, yes_state.avg_fill_price,
+            external_order_id=yes_place.external_order_id,
+        ),
+        leg_no=LegResult(
+            plan.leg_no,
+            no_state.status,
+            no_filled, no_state.avg_fill_price,
+            external_order_id=no_place.external_order_id,
+        ),
+        success=residual_unwound,
+        naked_leg_unwound=(residual >= MIN_RESIDUAL_CONTRACTS) and residual_unwound,
+        naked_leg_realized_usd=round(residual_realized, 4) if residual >= MIN_RESIDUAL_CONTRACTS else 0.0,
+        error=(
+            None if residual < MIN_RESIDUAL_CONTRACTS
+            else f"partial_hedge: hedged {hedged:.2f}, residual {residual:.2f} "
+                 f"{'unwound' if residual_unwound else 'NAKED — manual intervention'}"
+        ),
     )
 
 
@@ -325,6 +463,16 @@ async def _defend_naked_leg(
             "naked! Manual unwind required.",
             plan.correlation_id, e, filled_leg,
         )
+        # Naked exposure with no automated remediation. Halt the bot so we
+        # don't pile on more risk while one position is broken open.
+        await _emergency_halt(
+            db_path,
+            reason=(
+                f"naked_leg_market_sell_failed corr={plan.correlation_id} "
+                f"leg={filled_leg} contracts={filled_state.filled_contracts:.2f} "
+                f"avg_price={filled_state.avg_fill_price:.4f} err={e}"
+            ),
+        )
         return _build_naked_result(
             plan, yes_state, no_state, yes_place, no_place,
             naked_unwound=False, naked_realized=0.0,
@@ -344,6 +492,38 @@ async def _defend_naked_leg(
         plan, yes_state, no_state, yes_place, no_place,
         naked_unwound=True, naked_realized=pnl,
         error=f"naked_leg defended: {filled_leg} filled, {naked_leg} cancelled",
+    )
+
+
+async def _emergency_halt(db_path: str, *, reason: str) -> None:
+    """Stop the bot and leave a permanent record. Called when an automated
+    unwind path fails — naked exposure remains and a human must intervene.
+
+    Three actions, none of which can fail-silent:
+      1. Write data/STOP — main loop's safety_gate refuses new orders.
+      2. Append to data/CRITICAL_ALERTS.log — auditable post-mortem trail
+         that survives bot restarts (data/STOP gets removed on resolve).
+      3. Log at CRITICAL severity so any log-watcher / shipping pipeline
+         escalates appropriately.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    full_reason = f"EMERGENCY_HALT: {reason}"
+
+    try:
+        create_stop_file(full_reason)
+    except Exception as e:
+        log.error("emergency halt: STOP file write failed: %s", e)
+
+    try:
+        CRITICAL_ALERTS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CRITICAL_ALERTS_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{timestamp}\t{full_reason}\n")
+    except Exception as e:
+        log.error("emergency halt: CRITICAL_ALERTS.log write failed: %s", e)
+
+    log.critical(
+        "EMERGENCY HALT %s — bot stopped via STOP file. Reason: %s",
+        timestamp, reason,
     )
 
 
