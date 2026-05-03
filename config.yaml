@@ -190,6 +190,12 @@ execution:
                                       # starting value for early live trading; raise
                                       # once we have ≥1 week of stable operation.
                                       # Set to 0 to disable the cap.
+  portfolio_stop_loss_usd: -120       # If cumulative realized P&L across live trades
+                                      # falls below this (negative number), write
+                                      # data/STOP to halt new sends. Survives the
+                                      # current process — a manual review unblocks it.
+                                      # Default -120 = sized for $1000 bankroll
+                                      # (12% drawdown). Set to 0 to disable.
 
 # Position-monitor / exit logic. Each cycle, mark-to-market every open paper
 # trade; recommend EXIT when convergence threshold hit OR when annualized

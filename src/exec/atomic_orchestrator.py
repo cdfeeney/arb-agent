@@ -410,8 +410,13 @@ async def _defend_naked_leg(
     no_state: FillState,
     db_path: str,
 ) -> EntryResult:
-    """One leg filled, other didn't — cancel laggard, market-sell filled leg."""
-    if yes_state.status == "filled":
+    """One leg has real fills, other doesn't — cancel laggard, market-sell
+    filled leg. Branch on _has_real_fills (filled_contracts >= MIN_RESIDUAL),
+    NOT status string: a Polymarket FAK can land status='partial' with real
+    contracts. Pre-fix, this branched on status=='filled' and would tag the
+    OTHER leg as filled when yes was 'partial' — calling market_sell on the
+    wrong leg with 0 contracts and leaving the real position naked."""
+    if _has_real_fills(yes_state):
         filled_leg, filled_id, filled_state, filled_place, filled_ex = (
             "yes", yes_id, yes_state, yes_place, yes_ex,
         )
@@ -541,13 +546,13 @@ def _build_naked_result(
         plan=plan,
         leg_yes=LegResult(
             plan.leg_yes,
-            "filled" if yes_state.status == "filled" else "cancelled",
+            yes_state.status if _has_real_fills(yes_state) else "cancelled",
             yes_state.filled_contracts, yes_state.avg_fill_price,
             external_order_id=yes_place.external_order_id,
         ),
         leg_no=LegResult(
             plan.leg_no,
-            "filled" if no_state.status == "filled" else "cancelled",
+            no_state.status if _has_real_fills(no_state) else "cancelled",
             no_state.filled_contracts, no_state.avg_fill_price,
             external_order_id=no_place.external_order_id,
         ),

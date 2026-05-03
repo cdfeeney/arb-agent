@@ -120,6 +120,9 @@ class PollingAgent:
         )
         last_resolve = 0.0
         resolve_interval = float(self.cfg.get("polling", {}).get("resolve_interval_seconds", 3600))
+        stop_loss_threshold = float(
+            (self.cfg.get("execution", {}) or {}).get("portfolio_stop_loss_usd", 0.0)
+        )
         while True:
             try:
                 await self._poll_once()
@@ -132,6 +135,23 @@ class PollingAgent:
                 except Exception as e:
                     log.error("Resolver error: %s", e, exc_info=True)
                 last_resolve = now
+            # Portfolio stop-loss: cheap aggregate check. Fires data/STOP if
+            # cumulative realized < threshold; subsequent sends short-circuit
+            # via safety_gate. Disabled when threshold is 0 or positive.
+            if stop_loss_threshold < 0:
+                try:
+                    from src.exec.stop_loss import check_portfolio_stop_loss
+                    cumul, halted = await check_portfolio_stop_loss(
+                        self.cfg["database"]["path"], stop_loss_threshold,
+                    )
+                    if halted:
+                        log.critical(
+                            "PORTFOLIO STOP-LOSS TRIGGERED: cumulative=%.2f "
+                            "≤ threshold=%.2f — STOP file written",
+                            cumul, stop_loss_threshold,
+                        )
+                except Exception as e:
+                    log.error("stop-loss check failed: %s", e)
             await asyncio.sleep(self.cfg["polling"]["interval_seconds"])
 
     async def _poll_once(self):

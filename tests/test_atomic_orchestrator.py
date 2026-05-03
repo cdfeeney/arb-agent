@@ -251,6 +251,47 @@ async def test_partial_fill_unequal_unwinds_residual(db_path):
 
 
 @pytest.mark.asyncio
+async def test_naked_defense_branches_on_real_fills_not_status(db_path):
+    """REGRESSION (audit 2026-05-03): _defend_naked_leg used to branch on
+    status=='filled', but _has_real_fills accepts 'partial' too. When yes
+    was 'partial' with real contracts and no was 'cancelled', the old
+    code tagged 'no' as the filled leg and called market_sell with 0
+    contracts — leaving the real Polymarket position naked. Fix: branch
+    on _has_real_fills."""
+    opp, sizing = _make_opp_sizing(contracts=10.0)
+    plan = build_entry_plan(opp, sizing, paper_trade_id=13)
+    exchanges = {
+        # YES leg fills 70% as 'partial'
+        "kalshi": SimulatedExchange(
+            "kalshi",
+            SimSpec(fill_status="partial", fill_fraction=0.7,
+                    market_sell_price_per_contract=0.45),
+        ),
+        # NO leg cancels with zero fills
+        "polymarket": SimulatedExchange(
+            "polymarket", SimSpec(fill_status="cancelled"),
+        ),
+    }
+    result = await execute_atomic_entry(
+        plan=plan, exchanges=exchanges, db_path=db_path,
+        naked_leg_timeout_seconds=0.5, per_leg_timeout_seconds=2.0,
+        poll_interval_seconds=0.05,
+    )
+    # YES leg had 7 real partial-filled contracts. Defense should:
+    # 1. Identify yes (not no) as the filled side
+    # 2. Cancel no leg (already cancelled but be safe)
+    # 3. Market-sell 7 contracts on kalshi
+    assert result.success is False
+    assert result.naked_leg_unwound is True, (
+        f"naked unwind should fire for the partial-filled yes leg; "
+        f"got error={result.error}"
+    )
+    assert result.leg_yes.filled_contracts == 7.0
+    # naked_leg_realized_usd should be non-zero (real contracts sold)
+    assert result.naked_leg_realized_usd != 0.0
+
+
+@pytest.mark.asyncio
 async def test_partial_fill_one_below_min_residual_treated_as_naked(db_path):
     """yes leg fills 100%, no leg fills 0.1 contracts (below 0.5
     MIN_RESIDUAL) → no leg is treated as having no real fill; naked-leg
