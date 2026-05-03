@@ -304,33 +304,18 @@ def _decide(
             raw_size,
         )
 
-    # Hold-vs-exit gate: holding to resolution always pays $1 per contract
-    # fee-free (resolution settles automatically with no exchange fees).
-    # Exiting now pays sum_bids per contract minus exit_fee_per_contract.
-    # Hold strictly dominates unless sum_bids - exit_fee_per_contract > 1 —
-    # i.e. the basket has tipped above its own resolution payout, which is
-    # the only state where early exit captures more than holding.
-    #
-    # Discovered 2026-05-03 via Kashkari trades 398-402: each closed at
-    # sum_bids ≈ 0.98 (below 1.0) for ~$0.28 net vs $0.56 hold-value —
-    # five strict opportunity losses on the same pair. The earlier
-    # min_capture_above_fees gate caught fee-against-fee but not the
-    # bigger fee-vs-resolution comparison.
-    exit_fee_per_contract = exit_fees / raw_size if raw_size > 0 else 0
-    hold_threshold = 1.0 + exit_fee_per_contract
-    if sum_bids <= hold_threshold:
-        return (
-            "WATCH",
-            f"top-of-book {sum_bids:.4f} ≤ hold-threshold {hold_threshold:.4f} "
-            f"(=1.0 + exit_fee/c {exit_fee_per_contract:.4f}) — holding to "
-            f"resolution captures more than exiting now",
-            raw_size,
-        )
-
+    # Note: we deliberately do NOT add an absolute "hold-vs-exit" gate here
+    # (e.g. require sum_bids > 1.0 + exit_fee/c). Such a gate ignores capital
+    # velocity: with average per-trade returns of ~10%, capturing 40-50% of
+    # an arb in hours and redeploying beats holding 30 days for 100%, by
+    # ~30-100× annualized. The annualized_multiple gate above already
+    # compares annualized-now vs annualized-to-close and is the right frame.
+    # The min_capture_above_fees buffer is the safety floor against the
+    # broken-fee-math class of bug (trade #379 forensics).
     return (
         "PARTIAL_UNWIND",
         f"top-of-book {yes_bid:.4f}+{no_bid:.4f}={sum_bids:.4f} > "
-        f"hold-threshold {hold_threshold:.4f}, sell {raw_size:.2f} contracts "
+        f"cost {mark.cost_per_contract:.4f}, sell {raw_size:.2f} contracts "
         f"net ${net_realized:.2f} (gross ${gross_realized:.2f} - fees ${exit_fees:.2f}, "
         f"buffer {net_realized/exit_fees if exit_fees else float('inf'):.1f}×)",
         raw_size,
