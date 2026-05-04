@@ -78,6 +78,8 @@ def normalize_kalshi(raw: dict) -> Optional[dict]:
             "yes_ask_depth_contracts": yes_ask_size,
             "no_ask_depth_contracts": no_ask_size,
             "closes_at": _parse_dt(raw.get("close_time")),
+            "rules_primary": (raw.get("rules_primary", "") or "").strip(),
+            "rules_secondary": (raw.get("rules_secondary", "") or "").strip(),
             # Kalshi URL pattern: /markets/{series_ticker_lower}. The series
             # ticker is the leading hyphen-separated component of event_ticker
             # (KXTRUMPOUT27-27 → KXTRUMPOUT27 → kxtrumpout27). The fuller
@@ -166,6 +168,7 @@ def normalize_polymarket(raw: dict) -> Optional[dict]:
             "closes_at": _parse_dt(raw.get("endDate")),
             "neg_risk": bool(raw.get("negRisk", False)),
             "group_item_title": raw.get("groupItemTitle", "") or "",
+            "description": (raw.get("description", "") or "").strip(),
             "url": f"https://polymarket.com/event/{url_slug}",
         }
     except Exception as e:

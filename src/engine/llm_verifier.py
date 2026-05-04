@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +15,10 @@ Return a single JSON object: {{"is_match": true|false, "reasoning": "<1-2 senten
 Mark is_match=TRUE when:
 - The same real-world outcome resolves both markets to YES, AND
 - The resolution date/window aligns (within a few days), AND
-- The threshold (if any) is the same.
+- The threshold (if any) is the same, AND
+- The resolution-conditions text describes the same triggering event with the same
+  specificity (e.g. both require explicit recognition of the SAME person, not just
+  related state actions; both define the same threshold computation).
 
 Wording differences that DO NOT matter (still match):
 - "Will X win?" vs "Who will win? – X"
@@ -49,7 +53,16 @@ Mark is_match=FALSE when:
   leave). Trump can leave second → first market YES, second market NO. Mark is_match=FALSE.
 - ★ DATE-BUCKET MISMATCH inside a parametric series. Markets like "Will [X] before
   April 1?" vs "Will [X] before August 1?" are date-bucketed siblings, NOT the same
-  event. The shorter window is a proper subset of the longer.
+  event. The shorter window is a proper subset of the longer. Use the close-time
+  fields below as the discriminator: if the two close times differ by more than
+  3 days within a date-bucketed series, mark FALSE.
+- ★ RESOLUTION-CONDITIONS MISMATCH. The rules text below describes WHEN each market
+  resolves YES. If one requires X but the other requires X-and-Y, or one accepts a
+  broader set of triggers than the other, they are not the same event. Example:
+  Polymarket "US officially recognizes person Z" requiring direct US-government action
+  vs Kalshi "US recognizes person Z" allowing any branch of government — usually still
+  match if the government-action trigger is identical. But Polymarket "Trump declares
+  X" vs Kalshi "any US official declares X" is a real divergence — mark FALSE.
 
 Calibration: false positives cost real money; false negatives leave money on the table.
 Both are bad. Lean toward MATCH when the resolution criterion is clearly the same despite
@@ -63,12 +76,18 @@ Market A (Kalshi):
   YES means: {a_yes_sub}
   NO means:  {a_no_sub}
   Event ticker: {a_event_ticker}
+  Closes at: {a_closes_at}
+  Resolution rules:
+    {a_rules}
 
 Market B (Polymarket):
   Question: {b_question}
+  Closes at: {b_closes_at}
   Polymarket structural flags:
     negRisk = {b_neg_risk}            (true = exclusive-basket sub-outcome)
     groupItemTitle = "{b_group_item_title}"  (the sub-item label inside its basket)
+  Resolution description:
+    {b_description}
 
 Respond with JSON only, no prose."""
 
@@ -79,7 +98,7 @@ class LLMVerifier:
         db,
         api_key: str,
         model: str = "claude-haiku-4-5-20251001",
-        cache_hours: int = 24,
+        cache_hours: int = 720,  # 30 days; markets don't change semantics on a 24h timer
         max_concurrency: int = 10,
     ):
         self.db = db
@@ -101,9 +120,14 @@ class LLMVerifier:
     async def verify(self, market_a: dict, market_b: dict) -> Optional[bool]:
         """Returns True if markets are the same event, False if not, None on API error."""
         pair_id = self._pair_id(market_a, market_b)
+        content_hash = self._content_hash(market_a, market_b)
 
         cached = await self.db.get_verification(pair_id, self.cache_hours)
-        if cached is not None:
+        # If cache exists but the underlying market text/close-time has
+        # changed since we cached, force a re-verify. This catches the
+        # rare case where Polymarket extends a deadline or amends the
+        # description, or Kalshi rewrites rules_secondary.
+        if cached is not None and cached.get("content_hash") == content_hash:
             return cached["is_match"]
 
         prompt = VERIFY_PROMPT.format(
@@ -111,9 +135,13 @@ class LLMVerifier:
             a_yes_sub=market_a.get("yes_sub_title", "") or "(not specified)",
             a_no_sub=market_a.get("no_sub_title", "") or "(not specified)",
             a_event_ticker=market_a.get("event_ticker", "") or "(unknown)",
+            a_closes_at=str(market_a.get("closes_at", "") or "(unknown)"),
+            a_rules=self._kalshi_rules_text(market_a),
             b_question=market_b.get("question", ""),
+            b_closes_at=str(market_b.get("closes_at", "") or "(unknown)"),
             b_neg_risk=str(market_b.get("neg_risk", False)).lower(),
             b_group_item_title=market_b.get("group_item_title", "") or "",
+            b_description=(market_b.get("description", "") or "(none provided)")[:2000],
         )
 
         try:
@@ -127,7 +155,9 @@ class LLMVerifier:
 
         is_match = bool(result.get("is_match", False))
         reasoning = str(result.get("reasoning", ""))[:500]
-        await self.db.save_verification(pair_id, is_match, reasoning)
+        await self.db.save_verification(
+            pair_id, is_match, reasoning, content_hash=content_hash,
+        )
         log.info(
             "LLM verify %s → %s | %s",
             "MATCH" if is_match else "SKIP",
@@ -135,6 +165,34 @@ class LLMVerifier:
             reasoning,
         )
         return is_match
+
+    @staticmethod
+    def _kalshi_rules_text(market: dict) -> str:
+        """Concatenate Kalshi rules_primary + rules_secondary, truncated. Both
+        are normalized to '' when missing, so this is safe on partial data."""
+        primary = (market.get("rules_primary") or "").strip()
+        secondary = (market.get("rules_secondary") or "").strip()
+        text = (primary + ("\n" + secondary if secondary else "")).strip()
+        return text[:2000] if text else "(none provided)"
+
+    @staticmethod
+    def _content_hash(a: dict, b: dict) -> str:
+        """Hash of the inputs that affect verification outcome. If any of
+        these change after a cache write, we re-verify."""
+        payload = "|".join([
+            (a.get("question", "") or ""),
+            (a.get("yes_sub_title", "") or ""),
+            (a.get("no_sub_title", "") or ""),
+            str(a.get("closes_at", "") or ""),
+            (a.get("rules_primary", "") or ""),
+            (a.get("rules_secondary", "") or ""),
+            (b.get("question", "") or ""),
+            str(b.get("closes_at", "") or ""),
+            str(b.get("neg_risk", False)),
+            (b.get("group_item_title", "") or ""),
+            (b.get("description", "") or ""),
+        ])
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
     def _call_anthropic(self, prompt: str) -> dict:
         client = self._get_client()

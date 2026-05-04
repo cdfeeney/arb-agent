@@ -67,10 +67,16 @@ llm:
   provider: "anthropic"
   api_key_env: "ANTHROPIC_API_KEY"
   model: "claude-haiku-4-5-20251001"   # cheap + fast; bump to sonnet for tougher cases
-  cache_hours: 24              # re-verify a pair only after this long
+  cache_hours: 720             # 30 days. Markets don't change semantics on a 24h timer;
+                               # the question text + resolution rules + close_time are
+                               # essentially immutable once published. Content-hash
+                               # invalidation in llm_verifier.py forces re-verify when
+                               # any of those underlying fields actually change (e.g.
+                               # a Polymarket deadline extension).
   max_pairs_per_cycle: 400     # bumped from 200 (2026-04-30): with lower fuzz threshold + anchor bypass,
-                               # more candidate pairs flow. 24h LLM cache makes this cheap after first cycle —
-                               # only NEW pairs hit the API; previously-verified ones return instantly from DB.
+                               # more candidate pairs flow. 30-day LLM cache makes this cheap after first
+                               # day — only NEW or AMENDED pairs hit the API; previously-verified ones
+                               # return instantly from DB.
 
 filters:
   # 2026-05-02 STRATEGY PIVOT — Sub-week velocity:

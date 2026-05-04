@@ -312,6 +312,14 @@ class Database:
             await self._maybe_add_column(
                 db, "paper_trade_marks", "partial_unwind_realized_usd", "REAL",
             )
+            # Verifier cache: store a content hash so we can re-verify when
+            # the underlying market text or close-time changes (rare, but
+            # possible — Polymarket extends deadlines, Kalshi amends rules).
+            # Without this, a cached verification stays "valid" for cache_hours
+            # even if the markets it represents have diverged.
+            await self._maybe_add_column(
+                db, "verifications", "content_hash", "TEXT",
+            )
             await db.commit()
         log.info(f"Database ready: {self.path}")
 
@@ -328,20 +336,32 @@ class Database:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat()
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
-                "SELECT is_match, reasoning FROM verifications WHERE pair_id=? AND checked_at>?",
+                "SELECT is_match, reasoning, content_hash FROM verifications "
+                "WHERE pair_id=? AND checked_at>?",
                 (pair_id, cutoff),
             )
             row = await cur.fetchone()
             if row is None:
                 return None
-            return {"is_match": bool(row[0]), "reasoning": row[1]}
+            return {
+                "is_match": bool(row[0]),
+                "reasoning": row[1],
+                "content_hash": row[2],
+            }
 
-    async def save_verification(self, pair_id: str, is_match: bool, reasoning: str):
+    async def save_verification(
+        self, pair_id: str, is_match: bool, reasoning: str,
+        *, content_hash: str | None = None,
+    ):
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "INSERT OR REPLACE INTO verifications (pair_id, is_match, reasoning, checked_at) "
-                "VALUES (?,?,?,?)",
-                (pair_id, 1 if is_match else 0, reasoning, datetime.now(timezone.utc).isoformat()),
+                "INSERT OR REPLACE INTO verifications "
+                "(pair_id, is_match, reasoning, content_hash, checked_at) "
+                "VALUES (?,?,?,?,?)",
+                (
+                    pair_id, 1 if is_match else 0, reasoning, content_hash,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
             )
             await db.commit()
 
