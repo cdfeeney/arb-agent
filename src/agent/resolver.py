@@ -88,17 +88,51 @@ def _compute_realized(trade: dict, yes_won: int, no_won: int) -> tuple[float, fl
     The 'NO' leg pays $1 × contracts iff its market resolved NO.
     For a properly-matched arb, exactly ONE side pays — total payout =
     contracts × $1 regardless of which way the underlying event went.
-    """
-    yes_contracts = trade["yes_contracts"]
-    no_contracts  = trade["no_contracts"]
-    yes_payout = yes_contracts * 1.0 if yes_won == 1 else 0.0
-    no_payout  = no_contracts  * 1.0 if no_won  == 0 else 0.0
-    payout = yes_payout + no_payout
 
-    stake = trade["yes_size_usd"] + trade["no_size_usd"]
-    fees  = trade.get("fees_estimated_usd") or 0.0
-    profit = payout - stake - fees
-    return payout, profit
+    Partial-unwind aware: if the trade has been partially unwound (some
+    contracts already exited via maker-fill / taker-unwind), only the
+    REMAINING contracts settle at resolution. The banked partials already
+    contributed `partial_realized_usd` net of exit fees. We compute the
+    resolution-side profit on `contracts_remaining` and add it to the
+    banked partials.
+
+    Pre-fix behavior: this function used `yes_contracts` (the ORIGINAL
+    size) and ignored `contracts_remaining` + `partial_realized_usd`. On
+    a partially-unwound trade reaching resolution, the resolver overwrote
+    realized_profit_usd with the full-position math, deleting the banked
+    partials. Fixed 2026-05-04 after audit finding.
+    """
+    original_contracts = trade["yes_contracts"]
+    remaining = trade.get("contracts_remaining")
+    if remaining is None:
+        # Legacy rows pre-migration; assume no partial activity.
+        remaining = original_contracts
+    partial_realized = trade.get("partial_realized_usd") or 0.0
+
+    # Resolution-side payout on REMAINING contracts only
+    yes_payout = remaining * 1.0 if yes_won == 1 else 0.0
+    no_payout  = remaining * 1.0 if no_won  == 0 else 0.0
+    resolution_payout = yes_payout + no_payout
+
+    # Cost basis on remaining + prorated entry fees. Entry fees were paid
+    # on the original full position; the share attributable to whatever
+    # contracts are still open is proportional.
+    yes_price = trade.get("yes_observed_price") or 0.0
+    no_price  = trade.get("no_observed_price")  or 0.0
+    cost_per_contract = yes_price + no_price
+    remaining_cost = remaining * cost_per_contract
+    total_entry_fees = trade.get("fees_estimated_usd") or 0.0
+    remaining_fee_share = (
+        total_entry_fees * (remaining / original_contracts)
+        if original_contracts > 0 else 0.0
+    )
+
+    resolution_profit = resolution_payout - remaining_cost - remaining_fee_share
+    total_profit = partial_realized + resolution_profit
+
+    # Total payout for legacy reporting: resolution payout (the partials
+    # already happened, no additional payout there).
+    return resolution_payout, total_profit
 
 
 async def resolve_pending(db, kalshi):

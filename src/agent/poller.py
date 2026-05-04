@@ -255,7 +255,8 @@ class PollingAgent:
         dedup/cooldown checks below ensure the same pair_id from both loops
         doesn't double-fire.
         """
-        # Phase 1: eligibility — dedup, cooldown, sizing min_bet
+        # Phase 1: eligibility — dedup, cooldown, structural safety, sizing min_bet
+        from src.engine.pair_quality import classify_pair_structural
         eligible: list[tuple[dict, dict]] = []
         cooldown_minutes = self.exit_cfg.cooldown_minutes
         for opp in opportunities:
@@ -266,6 +267,16 @@ class PollingAgent:
             ):
                 log.info("Skipping %s — in re-entry cooldown (%dmin)",
                          opp["pair_id"][:60], cooldown_minutes)
+                continue
+            # Structural safety net (defense-in-depth — matcher should have
+            # rejected upstream, but we re-check here so a matcher
+            # regression can't ship a #395-class trade).
+            quality, reason = classify_pair_structural(opp)
+            if quality != "good":
+                log.warning(
+                    "REJECTED %s — pair_quality=%s (%s)",
+                    opp["pair_id"][:60], quality, reason,
+                )
                 continue
             sizing = size_position(opp, {**self.cfg["sizing"], "fees": self.cfg.get("fees", {})})
             if sizing["bet_size"] < self.cfg["sizing"]["min_bet"]:
